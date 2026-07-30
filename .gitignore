@@ -1,0 +1,14 @@
+/target/
+**/*.rs.bk
+Cargo.lock
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*.csgdb-wal
+*.csgdb-shm
+*.csgdb-tmp
+/bench-results/
+/coverage/
+/dist/
