@@ -7,19 +7,20 @@
 mod pool;
 
 pub use pool::{
-    DatabasePool, DatabasePoolBuilder, PoolOptions, PoolStats, ReadConnection, ReadTransaction,
-    WriteBackpressure, DEFAULT_READ_CONNECTIONS, DEFAULT_WRITE_QUEUE_CAPACITY,
+    BatchStatement, DatabasePool, DatabasePoolBuilder, PoolOptions, PoolStats, ReadConnection,
+    ReadTransaction, WriteBackpressure, DEFAULT_READ_CONNECTIONS, DEFAULT_WRITE_QUEUE_CAPACITY,
     MAX_READ_CONNECTIONS, MAX_WRITE_QUEUE_CAPACITY,
 };
 
 pub use csgdb_core::{
-    prepare_open, DatabaseIdentity, Error, ErrorCode, KeyProvider, KeySource, OpenFlags,
-    OpenOptions, OpenPlan, ResolvedKeyRef, ResolvedOpenPlan, Result, SecretKey, SecretString,
-    SecurityMode, TransactionState, Value, ValueRef, ValueType, ABI_VERSION, LIB_VERSION,
-    LIB_VERSION_NUMBER, RAW_KEY_LENGTH, SOURCE_ID,
+    prepare_open, CheckpointMode, CheckpointResult, DatabaseIdentity, Error, ErrorCode,
+    KeyProvider, KeySource, OpenFlags, OpenOptions, OpenPlan, ResolvedKeyRef, ResolvedOpenPlan,
+    Result, SecretKey, SecretString, SecurityMode, TransactionState, Value, ValueRef, ValueType,
+    ABI_VERSION, LIB_VERSION, LIB_VERSION_NUMBER, RAW_KEY_LENGTH, SOURCE_ID,
 };
 pub use csgdb_storage::{
     InterruptHandle, Row, Rows, Statement, Transaction, DEFAULT_PREPARED_STATEMENT_CACHE_CAPACITY,
+    MAX_WAL_AUTOCHECKPOINT_FRAMES,
 };
 
 use std::ffi::c_void;
@@ -287,6 +288,44 @@ impl Database {
     /// Returns an error when the timeout is outside the engine's range.
     pub fn set_busy_timeout(&self, timeout: Duration) -> Result<()> {
         self.connection.set_busy_timeout(timeout)
+    }
+
+    /// Runs a WAL checkpoint against the main database.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the storage engine cannot run the checkpoint.
+    /// Lock contention is returned as progress in [`CheckpointResult`].
+    pub fn checkpoint(&self, mode: CheckpointMode) -> Result<CheckpointResult> {
+        self.connection.checkpoint(mode)
+    }
+
+    /// Runs a WAL checkpoint against one attached database, or every attached
+    /// database when `database_name` is absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid database name or when the storage
+    /// engine cannot run the checkpoint. Lock contention is returned as
+    /// progress in [`CheckpointResult`].
+    pub fn checkpoint_database(
+        &self,
+        database_name: Option<&str>,
+        mode: CheckpointMode,
+    ) -> Result<CheckpointResult> {
+        self.connection.checkpoint_database(database_name, mode)
+    }
+
+    /// Sets the passive auto-checkpoint threshold for this connection.
+    ///
+    /// A threshold of zero disables automatic checkpoints.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the threshold exceeds the supported range or the
+    /// storage engine rejects the setting.
+    pub fn set_wal_autocheckpoint(&self, frames: u32) -> Result<()> {
+        self.connection.set_wal_autocheckpoint(frames)
     }
 
     /// Returns a thread-safe handle that can interrupt a running operation

@@ -1,19 +1,21 @@
 //! SQLCipher-backed transaction kernel adapter.
 
 use csgdb_core::{
-    Error, ErrorCode, OpenFlags as CoreOpenFlags, ResolvedKeyRef, ResolvedOpenPlan, Result,
-    SecurityMode, TransactionState, Value, ValueRef, ValueType,
+    CheckpointMode, CheckpointResult, Error, ErrorCode, OpenFlags as CoreOpenFlags, ResolvedKeyRef,
+    ResolvedOpenPlan, Result, SecurityMode, TransactionState, Value, ValueRef, ValueType,
 };
 use rusqlite::{
     ffi, types::ValueRef as SqlValueRef, CachedStatement, Connection as SqlConnection,
     OpenFlags as SqlOpenFlags,
 };
-use std::ffi::{c_int, c_void};
+use std::ffi::{c_int, c_void, CString};
+use std::ptr;
 use std::time::Duration;
 
 const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
 const MAX_BUSY_TIMEOUT_MILLIS: u128 = 2_147_483_647;
 pub const DEFAULT_PREPARED_STATEMENT_CACHE_CAPACITY: usize = 16;
+pub const MAX_WAL_AUTOCHECKPOINT_FRAMES: u32 = i32::MAX as u32;
 
 /// A live storage-kernel connection.
 pub struct Connection {
@@ -210,6 +212,89 @@ impl Connection {
         self.inner
             .busy_timeout(timeout)
             .map_err(|error| map_storage_error(&error))
+    }
+
+    /// Runs a WAL checkpoint against the main database.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the checkpoint cannot be started or the storage
+    /// engine reports a failure other than lock contention.
+    pub fn checkpoint(&self, mode: CheckpointMode) -> Result<CheckpointResult> {
+        self.checkpoint_database(Some("main"), mode)
+    }
+
+    /// Runs a WAL checkpoint against one attached database, or every attached
+    /// database when `database_name` is absent.
+    ///
+    /// Lock contention is reported in [`CheckpointResult`] so callers retain
+    /// the frame counts produced by the engine.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid database name or a storage failure
+    /// other than lock contention.
+    pub fn checkpoint_database(
+        &self,
+        database_name: Option<&str>,
+        mode: CheckpointMode,
+    ) -> Result<CheckpointResult> {
+        let database_name = database_name.map(CString::new).transpose().map_err(|_| {
+            Error::new(
+                ErrorCode::InvalidDatabaseName,
+                "database name contains an embedded NUL byte",
+            )
+        })?;
+        let database_name = database_name
+            .as_ref()
+            .map_or(ptr::null(), |name| name.as_ptr());
+        let mut wal_frames = -1;
+        let mut checkpointed_frames = -1;
+        // SAFETY: the connection owns a live handle, the optional database
+        // name remains valid for the call, and both output pointers are live.
+        let result = unsafe {
+            ffi::sqlite3_wal_checkpoint_v2(
+                self.inner.handle(),
+                database_name,
+                mode as c_int,
+                &raw mut wal_frames,
+                &raw mut checkpointed_frames,
+            )
+        };
+        if result != ffi::SQLITE_OK && result != ffi::SQLITE_BUSY {
+            return Err(map_raw_storage_error(result));
+        }
+
+        Ok(CheckpointResult::new(
+            non_negative_frame_count(wal_frames),
+            non_negative_frame_count(checkpointed_frames),
+            result == ffi::SQLITE_BUSY,
+        ))
+    }
+
+    /// Sets the connection-local passive auto-checkpoint threshold.
+    ///
+    /// A threshold of zero disables automatic checkpoints.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the threshold exceeds the engine's signed
+    /// 32-bit range or the engine rejects the setting.
+    pub fn set_wal_autocheckpoint(&self, frames: u32) -> Result<()> {
+        let frames = c_int::try_from(frames).map_err(|_| {
+            Error::new(
+                ErrorCode::InvalidCheckpointThreshold,
+                "WAL auto-checkpoint threshold exceeds the supported range",
+            )
+        })?;
+        // SAFETY: the connection owns a live handle and the threshold was
+        // validated for the engine's C integer API.
+        let result = unsafe { ffi::sqlite3_wal_autocheckpoint(self.inner.handle(), frames) };
+        if result == ffi::SQLITE_OK {
+            Ok(())
+        } else {
+            Err(map_raw_storage_error(result))
+        }
     }
 
     /// Creates a thread-safe handle for interrupting a long-running operation.
@@ -883,6 +968,17 @@ fn map_storage_error(error: &rusqlite::Error) -> Error {
         }
         _ => Error::new(ErrorCode::Storage, "database operation failed"),
     }
+}
+
+fn map_raw_storage_error(result: c_int) -> Error {
+    map_storage_error(&rusqlite::Error::SqliteFailure(
+        ffi::Error::new(result),
+        None,
+    ))
+}
+
+fn non_negative_frame_count(value: c_int) -> Option<u32> {
+    u32::try_from(value).ok()
 }
 
 #[must_use]

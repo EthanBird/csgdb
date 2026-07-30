@@ -39,6 +39,11 @@ extern "C" {
 #define CSGDB_TXN_READ 1
 #define CSGDB_TXN_WRITE 2
 
+#define CSGDB_CHECKPOINT_PASSIVE 0
+#define CSGDB_CHECKPOINT_FULL 1
+#define CSGDB_CHECKPOINT_RESTART 2
+#define CSGDB_CHECKPOINT_TRUNCATE 3
+
 #define CSGDB_INTEGER 1
 #define CSGDB_FLOAT 2
 #define CSGDB_TEXT 3
@@ -128,6 +133,17 @@ CSGDB_API int32_t csgdb_txn_state(
     const char *database_name
 );
 CSGDB_API int32_t csgdb_busy_timeout(csgdb *db, int32_t timeout_ms);
+CSGDB_API int32_t csgdb_wal_autocheckpoint(
+    csgdb *db,
+    int32_t frames
+);
+CSGDB_API int32_t csgdb_wal_checkpoint_v2(
+    csgdb *db,
+    const char *database_name,
+    int32_t mode,
+    int32_t *out_wal_frames,
+    int32_t *out_checkpointed_frames
+);
 CSGDB_API void csgdb_interrupt(csgdb *db);
 CSGDB_API int32_t csgdb_release_memory(csgdb *db);
 CSGDB_API int32_t csgdb_prepare_v2(

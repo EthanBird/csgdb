@@ -73,6 +73,10 @@ int main(int argc, char **argv) {
     if (rc != CSGDB_OK) {
         return fail(db, "busy timeout", rc);
     }
+    rc = csgdb_wal_autocheckpoint(db, 0);
+    if (rc != CSGDB_OK) {
+        return fail(db, "wal autocheckpoint", rc);
+    }
 
     const char *select_sql =
         "SELECT id, value, payload FROM smoke WHERE id = ?";
@@ -110,6 +114,20 @@ int main(int argc, char **argv) {
     rc = csgdb_release_memory(db);
     if (rc != CSGDB_OK) {
         return fail(db, "release memory", rc);
+    }
+    int32_t wal_frames = -1;
+    int32_t checkpointed_frames = -1;
+    rc = csgdb_wal_checkpoint_v2(
+        db,
+        "main",
+        CSGDB_CHECKPOINT_TRUNCATE,
+        &wal_frames,
+        &checkpointed_frames
+    );
+    if (rc != CSGDB_OK ||
+        wal_frames < 0 ||
+        wal_frames != checkpointed_frames) {
+        return fail(db, "wal checkpoint", rc);
     }
 
     rc = csgdb_close(db);

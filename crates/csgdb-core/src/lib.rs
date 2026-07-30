@@ -11,7 +11,7 @@ mod open;
 mod value;
 mod version;
 
-pub use connection::TransactionState;
+pub use connection::{CheckpointMode, CheckpointResult, TransactionState};
 pub use error::{Error, ErrorCode, Result};
 pub use key::{DatabaseIdentity, KeyProvider, KeySource, SecretKey, SecretString, RAW_KEY_LENGTH};
 pub use open::{

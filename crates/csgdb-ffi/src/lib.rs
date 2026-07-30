@@ -1,7 +1,7 @@
 use csgdb_api::Result as CsgResult;
 use csgdb_api::{
-    Database, Error, ErrorCode, InterruptHandle, KeySource, OpenFlags, OpenOptions, SecretKey,
-    SecretString, TransactionState,
+    CheckpointMode, Database, Error, ErrorCode, InterruptHandle, KeySource, OpenFlags, OpenOptions,
+    SecretKey, SecretString, TransactionState,
 };
 use csgdb_core::{
     ABI_VERSION, DEFAULT_BUSY_TIMEOUT_MS, DEFAULT_CACHE_SIZE_BYTES, DEFAULT_MEMORY_BUDGET_BYTES,
@@ -51,6 +51,11 @@ pub const CSGDB_INTERRUPT: i32 = 13;
 pub const CSGDB_TXN_NONE: i32 = 0;
 pub const CSGDB_TXN_READ: i32 = 1;
 pub const CSGDB_TXN_WRITE: i32 = 2;
+
+pub const CSGDB_CHECKPOINT_PASSIVE: i32 = 0;
+pub const CSGDB_CHECKPOINT_FULL: i32 = 1;
+pub const CSGDB_CHECKPOINT_RESTART: i32 = 2;
+pub const CSGDB_CHECKPOINT_TRUNCATE: i32 = 3;
 
 pub const CSGDB_INTEGER: i32 = 1;
 pub const CSGDB_FLOAT: i32 = 2;
@@ -619,6 +624,120 @@ pub unsafe extern "C" fn csgdb_busy_timeout(database: *mut CsgdbHandle, timeout_
         Ok(()) => {
             shared.set_ok();
             CSGDB_OK
+        }
+        Err(error) => shared.set_error(&error),
+    }
+}
+
+/// Sets the connection-local passive auto-checkpoint threshold.
+///
+/// A threshold of zero disables automatic checkpoints.
+///
+/// # Safety
+///
+/// `database` must be a live database handle.
+#[no_mangle]
+pub unsafe extern "C" fn csgdb_wal_autocheckpoint(
+    database: *mut CsgdbHandle,
+    frames: c_int,
+) -> i32 {
+    // SAFETY: the caller guarantees a null or live handle.
+    let Some(database) = (unsafe { database.as_ref() }) else {
+        return CSGDB_INVALID_ARGUMENT;
+    };
+    let Ok(frames) = u32::try_from(frames) else {
+        if let Some(shared) = database.database.as_ref() {
+            return shared.set_code(CSGDB_INVALID_ARGUMENT);
+        }
+        return CSGDB_INVALID_ARGUMENT;
+    };
+    let Some(shared) = database.database.as_ref() else {
+        return database.current_code();
+    };
+    let Ok(connection) = shared.database.lock() else {
+        return shared.set_code(CSGDB_STORAGE);
+    };
+    match connection.set_wal_autocheckpoint(frames) {
+        Ok(()) => {
+            shared.set_ok();
+            CSGDB_OK
+        }
+        Err(error) => shared.set_error(&error),
+    }
+}
+
+/// Runs a WAL checkpoint and reports engine frame counts.
+///
+/// A null `database_name` checkpoints all attached databases. Output pointers
+/// may be null. When present, unavailable frame counts are written as `-1`.
+///
+/// # Safety
+///
+/// `database` must be a live database handle. A non-null `database_name` must
+/// be a NUL-terminated UTF-8 string. Non-null output pointers must be writable.
+#[no_mangle]
+pub unsafe extern "C" fn csgdb_wal_checkpoint_v2(
+    database: *mut CsgdbHandle,
+    database_name: *const c_char,
+    mode: c_int,
+    out_wal_frames: *mut c_int,
+    out_checkpointed_frames: *mut c_int,
+) -> i32 {
+    // SAFETY: output pointer validity is part of the caller contract.
+    unsafe {
+        if let Some(output) = out_wal_frames.as_mut() {
+            *output = -1;
+        }
+        if let Some(output) = out_checkpointed_frames.as_mut() {
+            *output = -1;
+        }
+    }
+    // SAFETY: the caller guarantees a null or live handle.
+    let Some(database) = (unsafe { database.as_ref() }) else {
+        return CSGDB_INVALID_ARGUMENT;
+    };
+    let database_name = if database_name.is_null() {
+        None
+    } else {
+        match c_string(database_name) {
+            Ok(name) => Some(name),
+            Err(code) => {
+                if let Some(shared) = database.database.as_ref() {
+                    shared.set_code(code);
+                }
+                return code;
+            }
+        }
+    };
+    let Some(mode) = checkpoint_mode(mode) else {
+        if let Some(shared) = database.database.as_ref() {
+            return shared.set_code(CSGDB_INVALID_ARGUMENT);
+        }
+        return CSGDB_INVALID_ARGUMENT;
+    };
+    let Some(shared) = database.database.as_ref() else {
+        return database.current_code();
+    };
+    let Ok(connection) = shared.database.lock() else {
+        return shared.set_code(CSGDB_STORAGE);
+    };
+    match connection.checkpoint_database(database_name, mode) {
+        Ok(result) => {
+            // SAFETY: output pointer validity is part of the caller contract.
+            unsafe {
+                if let Some(output) = out_wal_frames.as_mut() {
+                    *output = optional_frame_count(result.wal_frames());
+                }
+                if let Some(output) = out_checkpointed_frames.as_mut() {
+                    *output = optional_frame_count(result.checkpointed_frames());
+                }
+            }
+            if result.is_busy() {
+                shared.set_code(CSGDB_BUSY)
+            } else {
+                shared.set_ok();
+                CSGDB_OK
+            }
         }
         Err(error) => shared.set_error(&error),
     }
@@ -1511,6 +1630,22 @@ fn map_sqlite_code(result: c_int) -> i32 {
     }
 }
 
+const fn checkpoint_mode(mode: c_int) -> Option<CheckpointMode> {
+    match mode {
+        CSGDB_CHECKPOINT_PASSIVE => Some(CheckpointMode::Passive),
+        CSGDB_CHECKPOINT_FULL => Some(CheckpointMode::Full),
+        CSGDB_CHECKPOINT_RESTART => Some(CheckpointMode::Restart),
+        CSGDB_CHECKPOINT_TRUNCATE => Some(CheckpointMode::Truncate),
+        _ => None,
+    }
+}
+
+fn optional_frame_count(frames: Option<u32>) -> c_int {
+    frames
+        .and_then(|frames| c_int::try_from(frames).ok())
+        .unwrap_or(-1)
+}
+
 unsafe fn open_from(
     path: *const c_char,
     out_db: *mut *mut CsgdbHandle,
@@ -1620,7 +1755,9 @@ fn error_code(error: &Error) -> i32 {
         | ErrorCode::ParameterCountMismatch
         | ErrorCode::InvalidColumnType
         | ErrorCode::InvalidUtf8
-        | ErrorCode::InvalidBusyTimeout => CSGDB_INVALID_ARGUMENT,
+        | ErrorCode::InvalidBusyTimeout
+        | ErrorCode::InvalidCheckpointThreshold
+        | ErrorCode::InvalidDatabaseName => CSGDB_INVALID_ARGUMENT,
         _ => CSGDB_STORAGE,
     }
 }
@@ -1734,6 +1871,75 @@ mod tests {
         let result =
             unsafe { csgdb_open_v2(c_path.as_ptr(), &raw mut database, flags, ptr::null()) };
         assert_eq!(result, CSGDB_OK);
+        assert_eq!(unsafe { csgdb_close(database) }, CSGDB_OK);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn checkpoint_c_api_controls_wal_and_validates_inputs() {
+        let (path, c_path) = test_path("checkpoint");
+        let key = [13_u8; 32];
+        let mut database = ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                csgdb_open_with_key(
+                    c_path.as_ptr(),
+                    key.as_ptr().cast(),
+                    key.len(),
+                    &raw mut database,
+                )
+            },
+            CSGDB_OK
+        );
+        assert_eq!(
+            unsafe { csgdb_wal_autocheckpoint(database, -1) },
+            CSGDB_INVALID_ARGUMENT
+        );
+        assert_eq!(unsafe { csgdb_wal_autocheckpoint(database, 0) }, CSGDB_OK);
+
+        let sql = CString::new(
+            "CREATE TABLE checkpoint_test(value INTEGER);
+             INSERT INTO checkpoint_test VALUES (1);",
+        )
+        .expect("SQL");
+        assert_eq!(unsafe { csgdb_exec(database, sql.as_ptr()) }, CSGDB_OK);
+
+        for mode in [
+            CSGDB_CHECKPOINT_PASSIVE,
+            CSGDB_CHECKPOINT_FULL,
+            CSGDB_CHECKPOINT_RESTART,
+            CSGDB_CHECKPOINT_TRUNCATE,
+        ] {
+            let mut wal_frames = -1;
+            let mut checkpointed_frames = -1;
+            assert_eq!(
+                unsafe {
+                    csgdb_wal_checkpoint_v2(
+                        database,
+                        c"main".as_ptr(),
+                        mode,
+                        &raw mut wal_frames,
+                        &raw mut checkpointed_frames,
+                    )
+                },
+                CSGDB_OK
+            );
+            assert_eq!(wal_frames, checkpointed_frames);
+            assert!(wal_frames >= 0);
+        }
+        assert_eq!(
+            unsafe {
+                csgdb_wal_checkpoint_v2(
+                    database,
+                    c"main".as_ptr(),
+                    99,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                )
+            },
+            CSGDB_INVALID_ARGUMENT
+        );
+
         assert_eq!(unsafe { csgdb_close(database) }, CSGDB_OK);
         remove_database(&path);
     }

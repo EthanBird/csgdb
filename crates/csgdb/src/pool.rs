@@ -1,7 +1,7 @@
 use crate::{
-    Database, DatabaseBuilder, Error, ErrorCode, KeyProvider, KeySource, OpenFlags, OpenOptions,
-    ResolvedOpenPlan, Result, SecretString, SecurityMode, Statement, Transaction, TransactionState,
-    Value,
+    CheckpointMode, CheckpointResult, Database, DatabaseBuilder, Error, ErrorCode, KeyProvider,
+    KeySource, OpenFlags, OpenOptions, ResolvedOpenPlan, Result, SecretString, SecurityMode,
+    Statement, Transaction, TransactionState, Value,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -71,6 +71,33 @@ pub enum WriteBackpressure {
     Timeout(Duration),
 }
 
+/// One owned parameterized statement in an atomic write batch.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BatchStatement {
+    sql: String,
+    parameters: Vec<Value>,
+}
+
+impl BatchStatement {
+    #[must_use]
+    pub fn new(sql: impl Into<String>, parameters: Vec<Value>) -> Self {
+        Self {
+            sql: sql.into(),
+            parameters,
+        }
+    }
+
+    #[must_use]
+    pub fn sql(&self) -> &str {
+        &self.sql
+    }
+
+    #[must_use]
+    pub fn parameters(&self) -> &[Value] {
+        &self.parameters
+    }
+}
+
 /// A point-in-time view of connection-manager activity.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct PoolStats {
@@ -84,6 +111,8 @@ pub struct PoolStats {
     pub write_jobs_submitted: u64,
     pub write_jobs_completed: u64,
     pub write_jobs_rejected: u64,
+    pub checkpoint_runs: u64,
+    pub incomplete_checkpoints: u64,
 }
 
 /// Builder for an encrypted or explicit-plaintext [`DatabasePool`].
@@ -440,6 +469,83 @@ impl DatabasePool {
         })
     }
 
+    /// Executes owned parameterized statements in one atomic transaction.
+    ///
+    /// The returned vector contains the changed-row count for each statement
+    /// in input order. Any preparation, binding, execution, or commit error
+    /// rolls back the entire batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when queueing, transaction management, binding, or
+    /// statement execution fails.
+    pub fn execute_transaction(
+        &self,
+        statements: impl IntoIterator<Item = BatchStatement>,
+    ) -> Result<Vec<usize>> {
+        let statements = statements.into_iter().collect::<Vec<_>>();
+        self.write(move |database| {
+            let transaction = database.transaction()?;
+            let mut changes = Vec::with_capacity(statements.len());
+            for statement in statements {
+                let parameters = statement
+                    .parameters
+                    .iter()
+                    .map(Value::as_ref)
+                    .collect::<Vec<_>>();
+                changes.push(transaction.execute(&statement.sql, &parameters)?);
+            }
+            transaction.commit()?;
+            Ok(changes)
+        })
+    }
+
+    /// Runs a WAL checkpoint on the writer connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when queueing or checkpoint execution fails.
+    pub fn checkpoint(&self, mode: CheckpointMode) -> Result<CheckpointResult> {
+        self.checkpoint_database(Some("main"), mode)
+    }
+
+    /// Runs a WAL checkpoint on one attached database, or every attached
+    /// database when `database_name` is absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when queueing, database-name validation, or
+    /// checkpoint execution fails.
+    pub fn checkpoint_database(
+        &self,
+        database_name: Option<&str>,
+        mode: CheckpointMode,
+    ) -> Result<CheckpointResult> {
+        let database_name = database_name.map(str::to_owned);
+        let metrics = Arc::clone(&self.inner.metrics);
+        self.write(move |database| {
+            let result = database.checkpoint_database(database_name.as_deref(), mode)?;
+            metrics.checkpoint_runs.fetch_add(1, Ordering::Relaxed);
+            if !result.is_complete() {
+                metrics
+                    .incomplete_checkpoints
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(result)
+        })
+    }
+
+    /// Sets the writer connection's passive auto-checkpoint threshold.
+    ///
+    /// A threshold of zero disables automatic checkpoints.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when queueing fails or the threshold is invalid.
+    pub fn set_wal_autocheckpoint(&self, frames: u32) -> Result<()> {
+        self.write(move |database| database.set_wal_autocheckpoint(frames))
+    }
+
     /// Interrupts the operation currently running on the writer connection.
     pub fn interrupt_writer(&self) {
         self.inner.writer_interrupt.interrupt();
@@ -492,6 +598,12 @@ impl DatabasePool {
                 .inner
                 .metrics
                 .write_jobs_rejected
+                .load(Ordering::Relaxed),
+            checkpoint_runs: self.inner.metrics.checkpoint_runs.load(Ordering::Relaxed),
+            incomplete_checkpoints: self
+                .inner
+                .metrics
+                .incomplete_checkpoints
                 .load(Ordering::Relaxed),
         }
     }
@@ -929,6 +1041,8 @@ struct PoolMetrics {
     write_jobs_submitted: AtomicU64,
     write_jobs_completed: AtomicU64,
     write_jobs_rejected: AtomicU64,
+    checkpoint_runs: AtomicU64,
+    incomplete_checkpoints: AtomicU64,
 }
 
 fn writer_main(mut database: Database, queue: &WriteQueue, metrics: &PoolMetrics) -> Result<()> {
@@ -1186,6 +1300,134 @@ mod tests {
                 .expect("latest value"),
             2
         );
+    }
+
+    #[test]
+    fn parameterized_transaction_batches_commit_or_rollback_atomically() {
+        let path = TestDatabasePath::new("transaction-batch");
+        let pool = test_pool(path.path(), 51, 1, 4);
+        pool.execute_batch(
+            "CREATE TABLE memory(
+                id INTEGER PRIMARY KEY,
+                body TEXT NOT NULL UNIQUE
+            );",
+        )
+        .expect("create table");
+
+        let changes = pool
+            .execute_transaction([
+                BatchStatement::new(
+                    "INSERT INTO memory(id, body) VALUES (?, ?)",
+                    vec![Value::Integer(1), Value::from("first")],
+                ),
+                BatchStatement::new(
+                    "INSERT INTO memory(id, body) VALUES (?, ?)",
+                    vec![Value::Integer(2), Value::from("second")],
+                ),
+            ])
+            .expect("commit batch");
+        assert_eq!(changes, [1, 1]);
+
+        let error = pool
+            .execute_transaction([
+                BatchStatement::new(
+                    "INSERT INTO memory(id, body) VALUES (?, ?)",
+                    vec![Value::Integer(3), Value::from("third")],
+                ),
+                BatchStatement::new(
+                    "INSERT INTO memory(id, body) VALUES (?, ?)",
+                    vec![Value::Integer(4), Value::from("second")],
+                ),
+            ])
+            .expect_err("constraint failure must reject the batch");
+        assert_eq!(error.code(), ErrorCode::ConstraintViolation);
+        assert_eq!(
+            pool.query_i64("SELECT count(*) FROM memory")
+                .expect("count committed rows"),
+            2
+        );
+        assert_eq!(
+            pool.query_i64("SELECT count(*) FROM memory WHERE id = 3")
+                .expect("verify rollback"),
+            0
+        );
+    }
+
+    #[test]
+    fn checkpoint_reports_long_snapshot_interference_and_truncates_after_release() {
+        let path = TestDatabasePath::new("checkpoint-snapshot");
+        let pool = test_pool(path.path(), 52, 1, 8);
+        pool.set_wal_autocheckpoint(0)
+            .expect("disable auto-checkpoint");
+        pool.execute_batch(
+            "CREATE TABLE event(
+                id INTEGER PRIMARY KEY,
+                body TEXT NOT NULL
+            );
+            INSERT INTO event(body) VALUES ('initial');",
+        )
+        .expect("initialize database");
+        for mode in [
+            CheckpointMode::Passive,
+            CheckpointMode::Full,
+            CheckpointMode::Restart,
+            CheckpointMode::Truncate,
+        ] {
+            assert!(
+                pool.checkpoint(mode)
+                    .expect("initial checkpoint")
+                    .is_complete(),
+                "{mode:?} checkpoint must complete without a reader"
+            );
+        }
+
+        let (snapshot_ready_tx, snapshot_ready_rx) = mpsc::sync_channel(0);
+        let (release_snapshot_tx, release_snapshot_rx) = mpsc::sync_channel(0);
+        let reader_pool = pool.clone();
+        let reader = thread::spawn(move || {
+            reader_pool.read(|connection| {
+                let transaction = connection.transaction()?;
+                let visible_rows = transaction.query_i64("SELECT count(*) FROM event")?;
+                snapshot_ready_tx.send(()).expect("signal snapshot");
+                release_snapshot_rx.recv().expect("release snapshot");
+                transaction.commit()?;
+                Ok(visible_rows)
+            })
+        });
+        snapshot_ready_rx.recv().expect("snapshot ready");
+
+        let statements = (0_i64..128).map(|id| {
+            BatchStatement::new(
+                "INSERT INTO event(id, body) VALUES (?, ?)",
+                vec![Value::Integer(id + 2), Value::Text(format!("event-{id}"))],
+            )
+        });
+        let changes = pool
+            .execute_transaction(statements)
+            .expect("write behind snapshot");
+        assert_eq!(changes.len(), 128);
+
+        let passive = pool
+            .checkpoint(CheckpointMode::Passive)
+            .expect("passive checkpoint");
+        assert!(!passive.is_complete());
+        assert!(
+            passive.remaining_frames().is_some_and(|frames| frames > 0),
+            "long snapshot must leave observable WAL frames"
+        );
+
+        release_snapshot_tx.send(()).expect("release snapshot");
+        assert_eq!(reader.join().expect("reader thread").expect("snapshot"), 1);
+
+        let truncate = pool
+            .checkpoint(CheckpointMode::Truncate)
+            .expect("truncate checkpoint");
+        assert!(truncate.is_complete());
+        assert_eq!(truncate.remaining_frames(), Some(0));
+
+        let stats = pool.stats();
+        assert_eq!(stats.checkpoint_runs, 6);
+        assert_eq!(stats.incomplete_checkpoints, 1);
     }
 
     #[test]

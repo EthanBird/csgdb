@@ -16,6 +16,8 @@ pub enum ErrorCode {
     InvalidUtf8,
     InvalidStatementState,
     InvalidBusyTimeout,
+    InvalidCheckpointThreshold,
+    InvalidDatabaseName,
     InvalidPoolConfiguration,
     KeyRequired,
     KeyStoreUnavailable,

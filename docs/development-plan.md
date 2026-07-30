@@ -25,11 +25,16 @@
 - Rust `DatabasePool` 有界只读连接池与专用单写线程；
 - 等待、立即拒绝、限时等待三种写入背压策略和运行统计；
 - WAL 读快照、只读强制、池耗尽、队列饱和和写线程恢复测试；
+- PASSIVE、FULL、RESTART、TRUNCATE 四种手动 WAL Checkpoint；
+- 自动 Checkpoint 帧阈值控制和 C ABI 对等接口；
+- 拥有所有权的参数化语句列表在单事务中批量提交；
+- 批量约束失败整体回滚和长读快照阻碍 WAL 回收测试；
+- Checkpoint 运行次数、不完整次数和逐次帧进度观测；
 - 加密文件头、正确密钥重开、错误密钥拒绝和明文兼容测试；
 - 经实际构建验证的 Rust 1.82 最低工具链；
 - 格式、Clippy、测试、文档和 C 头文件检查的 CI。
 
-当前仍是开发版本。尚未完成 Group Commit、Checkpoint 管理、平台密钥库适配、类型化 Schema 和断电故障注入。下一切片优先完成可控 WAL Checkpoint、写任务批量提交和长快照干扰测试。
+当前仍是开发版本。尚未完成相邻任务 Group Commit、自动 Checkpoint 调度、平台密钥库适配、类型化 Schema 和断电故障注入。下一切片优先实现有界 Group Commit，并在不突破写入延迟和 WAL 上限的前提下建立自动维护策略。
 
 ## M0：规格与工程骨架
 

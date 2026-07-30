@@ -298,6 +298,7 @@ csgdb_column_int / int64 / double / text / blob / bytes
 csgdb_changes64 / total_changes64 / last_insert_rowid
 csgdb_get_autocommit / db_readonly / txn_state
 csgdb_busy_timeout / interrupt / release_memory
+csgdb_wal_autocheckpoint / wal_checkpoint_v2
 
 csgdb_errcode / errmsg / errstr
 csgdb_close
@@ -323,10 +324,31 @@ csgdb_close_v2
 - `csgdb_txn_state(db, NULL)` 返回所有已附加数据库中的最高事务活动，状态为 `CSGDB_TXN_NONE`、`CSGDB_TXN_READ` 或 `CSGDB_TXN_WRITE`；
 - `csgdb_db_readonly` 返回 `1` 或 `0`，无效数据库名和检查失败返回 `-1`；
 - `csgdb_busy_timeout` 接受非负毫秒值，后一次调用替换前一次配置；
+- `csgdb_wal_autocheckpoint` 设置连接本地的 PASSIVE 自动 Checkpoint 帧阈值，零表示禁用；
+- `csgdb_wal_checkpoint_v2` 接受 PASSIVE、FULL、RESTART 或 TRUNCATE 模式，并分别输出 WAL 总帧数和已经复制的帧数；
 - `csgdb_interrupt` 可以从另一个线程调用，不等待正在执行语句持有的连接锁；
 - `csgdb_release_memory` 主动释放连接本地的可回收缓存。
 
 `csgdb_interrupt` 与其他连接操作并发调用是安全的，但调用方必须保证数据库句柄在中断调用返回前仍然存活；不得令 `close` 与 `interrupt` 竞争。被取消的 `step` 返回 `CSGDB_INTERRUPT`。连接本身仍可继续使用，Statement 应先 `finalize`，或按其状态执行 `reset` 后再复用。
+
+Checkpoint 的 C 用法：
+
+```c
+int32_t wal_frames = -1;
+int32_t checkpointed_frames = -1;
+
+csgdb_wal_autocheckpoint(db, 0);
+
+int rc = csgdb_wal_checkpoint_v2(
+    db,
+    "main",
+    CSGDB_CHECKPOINT_PASSIVE,
+    &wal_frames,
+    &checkpointed_frames
+);
+```
+
+数据库名为 `NULL` 时检查所有附加库，输出指针可以为 `NULL`。帧数不可用时写入 `-1`。PASSIVE 模式不等待读写锁；它可能返回 `CSGDB_OK`，同时 `checkpointed_frames < wal_frames`，这表示长快照等因素仍阻碍部分帧回收。FULL、RESTART 或 TRUNCATE 无法取得所需锁时返回 `CSGDB_BUSY`，但仍保留引擎给出的帧数。
 
 ## 8. Rust API
 
@@ -438,6 +460,24 @@ db.release_memory()?;
 
 `is_readonly("main")` 检查指定数据库的打开模式，`is_busy()` 表示当前连接是否存在尚未完成的 Statement，`is_interrupted()` 表示连接中断当前是否仍在生效。`transaction_state(None)` 汇总所有已附加数据库，传入 `Some("main")` 则只检查主库。
 
+手动 WAL 维护：
+
+```rust
+use csgdb::CheckpointMode;
+
+db.set_wal_autocheckpoint(0)?;
+
+let progress = db.checkpoint(CheckpointMode::Passive)?;
+if !progress.is_complete() {
+    eprintln!(
+        "{} WAL frames remain",
+        progress.remaining_frames().unwrap_or_default()
+    );
+}
+```
+
+`checkpoint` 只处理主库，`checkpoint_database(Some(name), mode)` 可以指定附加库，传入 `None` 时处理所有附加库。`CheckpointResult` 区分锁竞争与未完整复制，并保留 WAL 总帧数、已复制帧数和剩余帧数。RESTART 和 TRUNCATE 可能等待读连接，通常应放在维护窗口；前台观测优先使用 PASSIVE。
+
 长查询取消通过与数据库借用分离的 `InterruptHandle` 完成：
 
 ```rust
@@ -485,6 +525,25 @@ let count = pool.query_i64("SELECT count(*) FROM event")?;
 
 打开时先创建一个可写连接并启用 WAL，再使用同一个已解析密钥打开固定数量的文件级只读连接。默认值为 2 个读连接和 64 个等待写任务。内存数据库不支持多连接池，应继续使用单连接 `Database`。
 
+多个参数化写入可以作为单个队列任务和单个事务提交：
+
+```rust
+use csgdb::{BatchStatement, Value};
+
+let changes = pool.execute_transaction([
+    BatchStatement::new(
+        "INSERT INTO event(body) VALUES (?)",
+        vec![Value::from("observed")],
+    ),
+    BatchStatement::new(
+        "UPDATE agent_state SET revision = revision + 1 WHERE id = ?",
+        vec![Value::Integer(7)],
+    ),
+])?;
+```
+
+返回值按输入顺序给出每条语句的变更行数。任一语句的准备、绑定、执行或提交失败都会回滚整个批次。该接口是调用方显式划定的原子批量事务，不会自动合并不同调用方的任务，因此不等同于 Group Commit。
+
 需要流式行或多语句快照时使用读回调：
 
 ```rust
@@ -521,7 +580,7 @@ let result = pool.write_with_policy(
 
 写回调及返回值必须满足 `Send + 'static`，因此排队参数使用拥有所有权的 `Value`，而不是借用型 `ValueRef`。同一池的递归读返回 `ReentrantRead`，读回调或写回调中的同步写提交返回 `ReentrantWrite`，从结构上阻止自等待死锁。回调 panic 返回 `WriteTaskPanicked`，不会停止写线程。
 
-`stats()` 返回读连接使用量、当前排队任务、写线程活动状态及提交/完成/拒绝计数。`interrupt_writer()` 可从控制线程取消当前写任务。`close()` 只有在其他池克隆全部释放后才成功，否则返回 `ConnectionManagerInUse`。
+`checkpoint`、`checkpoint_database` 和 `set_wal_autocheckpoint` 也通过单写线程串行执行，避免与普通写任务同时操作维护状态。`stats()` 返回读连接使用量、当前排队任务、写线程活动状态、提交/完成/拒绝计数，以及 Checkpoint 运行和未完整回收次数。`interrupt_writer()` 可从控制线程取消当前写任务。`close()` 只有在其他池克隆全部释放后才成功，否则返回 `ConnectionManagerInUse`。
 
 异步接口通过专用数据库工作线程实现，不要求底层文件 I/O 伪装成异步操作。
 
