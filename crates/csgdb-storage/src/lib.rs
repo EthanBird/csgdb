@@ -2,12 +2,16 @@
 
 use csgdb_core::{
     Error, ErrorCode, OpenFlags as CoreOpenFlags, ResolvedKeyRef, ResolvedOpenPlan, Result,
-    SecurityMode,
+    SecurityMode, Value, ValueRef, ValueType,
 };
-use rusqlite::{ffi, Connection as SqlConnection, OpenFlags as SqlOpenFlags};
-use std::ffi::c_int;
+use rusqlite::{
+    ffi, types::ValueRef as SqlValueRef, CachedStatement, Connection as SqlConnection,
+    OpenFlags as SqlOpenFlags,
+};
+use std::ffi::{c_int, c_void};
 
 const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
+pub const DEFAULT_PREPARED_STATEMENT_CACHE_CAPACITY: usize = 16;
 
 /// A live storage-kernel connection.
 pub struct Connection {
@@ -36,6 +40,7 @@ impl Connection {
             .busy_timeout(plan.busy_timeout())
             .map_err(|error| map_storage_error(&error))?;
         configure_connection(&inner, plan)?;
+        inner.set_prepared_statement_cache_capacity(DEFAULT_PREPARED_STATEMENT_CACHE_CAPACITY);
 
         Ok(Self {
             inner,
@@ -59,15 +64,66 @@ impl Connection {
             .map_err(|error| map_storage_error(&error))
     }
 
-    /// Executes one SQL statement without bound parameters.
+    /// Executes one SQL statement with positional parameters.
     ///
     /// # Errors
     ///
     /// Returns an error when the statement fails or returns rows.
-    pub fn execute(&self, sql: &str) -> Result<usize> {
-        self.inner
-            .execute(sql, [])
-            .map_err(|error| map_storage_error(&error))
+    pub fn execute(&self, sql: &str, parameters: &[ValueRef<'_>]) -> Result<usize> {
+        self.prepare_cached(sql)?.execute(parameters)
+    }
+
+    /// Compiles a SQL statement.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the SQL cannot be compiled.
+    pub fn prepare(&self, sql: &str) -> Result<Statement<'_>> {
+        let inner = self
+            .inner
+            .prepare(sql)
+            .map_err(|error| map_storage_error(&error))?;
+        Ok(Statement::direct(inner))
+    }
+
+    /// Compiles a SQL statement using the connection's bounded LRU cache.
+    ///
+    /// The statement is returned to the cache when it is dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the SQL cannot be compiled.
+    pub fn prepare_cached(&self, sql: &str) -> Result<Statement<'_>> {
+        let inner = self
+            .inner
+            .prepare_cached(sql)
+            .map_err(|error| map_storage_error(&error))?;
+        Ok(Statement::cached(inner))
+    }
+
+    /// Changes the maximum number of idle compiled statements retained by
+    /// the connection's LRU cache.
+    pub fn set_prepared_statement_cache_capacity(&self, capacity: usize) {
+        self.inner.set_prepared_statement_cache_capacity(capacity);
+    }
+
+    /// Finalizes every idle statement currently held by the connection cache.
+    pub fn flush_prepared_statement_cache(&self) {
+        self.inner.flush_prepared_statement_cache();
+    }
+
+    /// Returns the underlying SQL connection pointer for the C ABI layer.
+    ///
+    /// # Safety
+    ///
+    /// The pointer is valid only while this `Connection` remains alive. The
+    /// caller must serialize all uses with safe connection operations, must
+    /// not close it, and must not retain references derived from it.
+    #[doc(hidden)]
+    pub unsafe fn as_raw_handle(&self) -> *mut c_void {
+        // SAFETY: the caller accepts the lifetime and synchronization
+        // requirements documented above.
+        unsafe { self.inner.handle().cast() }
     }
 
     /// Reads a single integer value.
@@ -137,6 +193,28 @@ impl Transaction<'_> {
             .map_err(|error| map_storage_error(&error))
     }
 
+    /// Executes one SQL statement with positional parameters.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when compilation, binding, or execution fails.
+    pub fn execute(&self, sql: &str, parameters: &[ValueRef<'_>]) -> Result<usize> {
+        self.prepare(sql)?.execute(parameters)
+    }
+
+    /// Compiles a SQL statement scoped to this transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the SQL cannot be compiled.
+    pub fn prepare(&self, sql: &str) -> Result<Statement<'_>> {
+        let inner = self
+            .inner
+            .prepare(sql)
+            .map_err(|error| map_storage_error(&error))?;
+        Ok(Statement::direct(inner))
+    }
+
     /// Commits all transaction changes.
     ///
     /// # Errors
@@ -158,6 +236,279 @@ impl Transaction<'_> {
             .rollback()
             .map_err(|error| map_storage_error(&error))
     }
+}
+
+enum StatementInner<'connection> {
+    Direct(rusqlite::Statement<'connection>),
+    Cached(CachedStatement<'connection>),
+}
+
+/// A compiled SQL statement.
+///
+/// A statement borrows its connection, so it cannot outlive the database that
+/// compiled it. Bound text and blob values are copied by the storage engine.
+pub struct Statement<'connection> {
+    inner: StatementInner<'connection>,
+}
+
+impl<'connection> Statement<'connection> {
+    fn direct(inner: rusqlite::Statement<'connection>) -> Self {
+        Self {
+            inner: StatementInner::Direct(inner),
+        }
+    }
+
+    fn cached(inner: CachedStatement<'connection>) -> Self {
+        Self {
+            inner: StatementInner::Cached(inner),
+        }
+    }
+
+    fn inner(&self) -> &rusqlite::Statement<'connection> {
+        match &self.inner {
+            StatementInner::Direct(inner) => inner,
+            StatementInner::Cached(inner) => inner,
+        }
+    }
+
+    fn inner_mut(&mut self) -> &mut rusqlite::Statement<'connection> {
+        match &mut self.inner {
+            StatementInner::Direct(inner) => inner,
+            StatementInner::Cached(inner) => inner,
+        }
+    }
+
+    #[must_use]
+    pub fn parameter_count(&self) -> usize {
+        self.inner().parameter_count()
+    }
+
+    #[must_use]
+    pub fn column_count(&self) -> usize {
+        self.inner().column_count()
+    }
+
+    /// Returns a result-column name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `index` is outside the result column range.
+    pub fn column_name(&self, index: usize) -> Result<&str> {
+        self.inner().column_name(index).map_err(|_| {
+            Error::new(
+                ErrorCode::InvalidColumnIndex,
+                "result column index is out of range",
+            )
+        })
+    }
+
+    /// Executes the statement with an exact positional parameter list.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on a parameter count mismatch or execution failure.
+    pub fn execute(&mut self, parameters: &[ValueRef<'_>]) -> Result<usize> {
+        self.bind_all(parameters)?;
+        self.inner_mut()
+            .raw_execute()
+            .map_err(|error| map_storage_error(&error))
+    }
+
+    /// Starts a streaming query with an exact positional parameter list.
+    ///
+    /// Only the current row is borrowed from the engine at a time. Calling
+    /// [`Rows::next_row`] invalidates the previously returned row.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on a parameter count mismatch or binding failure.
+    pub fn query<'statement>(
+        &'statement mut self,
+        parameters: &[ValueRef<'_>],
+    ) -> Result<Rows<'statement>> {
+        self.bind_all(parameters)?;
+        Ok(Rows {
+            inner: self.inner_mut().raw_query(),
+        })
+    }
+
+    /// Removes all parameter bindings.
+    pub fn clear_bindings(&mut self) {
+        self.inner_mut().clear_bindings();
+    }
+
+    fn bind_all(&mut self, parameters: &[ValueRef<'_>]) -> Result<()> {
+        let expected = self.parameter_count();
+        if parameters.len() != expected {
+            return Err(Error::new(
+                ErrorCode::ParameterCountMismatch,
+                "SQL parameter count does not match the supplied values",
+            ));
+        }
+
+        self.clear_bindings();
+        for (offset, value) in parameters.iter().copied().enumerate() {
+            let index = offset + 1;
+            let result = match value {
+                ValueRef::Null => self
+                    .inner_mut()
+                    .raw_bind_parameter(index, rusqlite::types::Null),
+                ValueRef::Integer(value) => self.inner_mut().raw_bind_parameter(index, value),
+                ValueRef::Real(value) => self.inner_mut().raw_bind_parameter(index, value),
+                ValueRef::Text(value) => self.inner_mut().raw_bind_parameter(index, value),
+                ValueRef::Blob(value) => self.inner_mut().raw_bind_parameter(index, value),
+            };
+            result.map_err(|error| map_storage_error(&error))?;
+        }
+        Ok(())
+    }
+}
+
+/// A forward-only stream of query rows.
+pub struct Rows<'statement> {
+    inner: rusqlite::Rows<'statement>,
+}
+
+impl Rows<'_> {
+    /// Advances to the next result row.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the storage engine cannot continue the query.
+    pub fn next_row(&mut self) -> Result<Option<Row<'_>>> {
+        self.inner
+            .next()
+            .map(|row| row.map(|inner| Row { inner }))
+            .map_err(|error| map_storage_error(&error))
+    }
+}
+
+/// A borrowed query result row.
+///
+/// The row is valid only until its parent [`Rows`] stream advances.
+pub struct Row<'row> {
+    inner: &'row rusqlite::Row<'row>,
+}
+
+impl Row<'_> {
+    #[must_use]
+    pub fn column_count(&self) -> usize {
+        self.inner.as_ref().column_count()
+    }
+
+    /// Returns a column name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `index` is outside the result column range.
+    pub fn column_name(&self, index: usize) -> Result<&str> {
+        self.inner.as_ref().column_name(index).map_err(|_| {
+            Error::new(
+                ErrorCode::InvalidColumnIndex,
+                "result column index is out of range",
+            )
+        })
+    }
+
+    /// Returns a borrowed dynamically typed column value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an out-of-range column or invalid UTF-8 text.
+    pub fn value_ref(&self, index: usize) -> Result<ValueRef<'_>> {
+        if index >= self.column_count() {
+            return Err(Error::new(
+                ErrorCode::InvalidColumnIndex,
+                "result column index is out of range",
+            ));
+        }
+        match self
+            .inner
+            .get_ref(index)
+            .map_err(|error| map_storage_error(&error))?
+        {
+            SqlValueRef::Null => Ok(ValueRef::Null),
+            SqlValueRef::Integer(value) => Ok(ValueRef::Integer(value)),
+            SqlValueRef::Real(value) => Ok(ValueRef::Real(value)),
+            SqlValueRef::Text(value) => std::str::from_utf8(value)
+                .map(ValueRef::Text)
+                .map_err(|_| Error::new(ErrorCode::InvalidUtf8, "text value is not valid UTF-8")),
+            SqlValueRef::Blob(value) => Ok(ValueRef::Blob(value)),
+        }
+    }
+
+    /// Copies a dynamically typed column value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an out-of-range column or invalid UTF-8 text.
+    pub fn value(&self, index: usize) -> Result<Value> {
+        self.value_ref(index).map(ValueRef::to_owned)
+    }
+
+    /// Returns the storage class of a column value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `index` is outside the result column range.
+    pub fn value_type(&self, index: usize) -> Result<ValueType> {
+        self.value_ref(index).map(ValueRef::value_type)
+    }
+
+    /// Returns an integer without applying cross-type coercion.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the column is not an integer.
+    pub fn get_i64(&self, index: usize) -> Result<i64> {
+        match self.value_ref(index)? {
+            ValueRef::Integer(value) => Ok(value),
+            _ => Err(invalid_column_type()),
+        }
+    }
+
+    /// Returns a floating-point value without applying cross-type coercion.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the column is not a real value.
+    pub fn get_f64(&self, index: usize) -> Result<f64> {
+        match self.value_ref(index)? {
+            ValueRef::Real(value) => Ok(value),
+            _ => Err(invalid_column_type()),
+        }
+    }
+
+    /// Returns text without applying cross-type coercion.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the column is not valid UTF-8 text.
+    pub fn get_text(&self, index: usize) -> Result<&str> {
+        match self.value_ref(index)? {
+            ValueRef::Text(value) => Ok(value),
+            _ => Err(invalid_column_type()),
+        }
+    }
+
+    /// Returns a blob without applying cross-type coercion.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the column is not a blob.
+    pub fn get_blob(&self, index: usize) -> Result<&[u8]> {
+        match self.value_ref(index)? {
+            ValueRef::Blob(value) => Ok(value),
+            _ => Err(invalid_column_type()),
+        }
+    }
+}
+
+fn invalid_column_type() -> Error {
+    Error::new(
+        ErrorCode::InvalidColumnType,
+        "result column has an incompatible storage class",
+    )
 }
 
 fn sqlite_open_flags(flags: CoreOpenFlags) -> SqlOpenFlags {
@@ -306,6 +657,28 @@ fn map_storage_error(error: &rusqlite::Error) -> Error {
             }
             _ => Error::new(ErrorCode::Storage, "database operation failed"),
         },
+        rusqlite::Error::SqlInputError { .. } => {
+            Error::new(ErrorCode::InvalidSql, "SQL statement is invalid")
+        }
+        rusqlite::Error::InvalidParameterCount(_, _) => Error::new(
+            ErrorCode::ParameterCountMismatch,
+            "SQL parameter count does not match the supplied values",
+        ),
+        rusqlite::Error::InvalidParameterName(_) => Error::new(
+            ErrorCode::InvalidParameterIndex,
+            "SQL parameter index or name is invalid",
+        ),
+        rusqlite::Error::InvalidColumnIndex(_) => Error::new(
+            ErrorCode::InvalidColumnIndex,
+            "result column index is out of range",
+        ),
+        rusqlite::Error::InvalidColumnType(_, _, _) => Error::new(
+            ErrorCode::InvalidColumnType,
+            "result column has an incompatible storage class",
+        ),
+        rusqlite::Error::Utf8Error(..) => {
+            Error::new(ErrorCode::InvalidUtf8, "text value is not valid UTF-8")
+        }
         _ => Error::new(ErrorCode::Storage, "database operation failed"),
     }
 }

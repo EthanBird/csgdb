@@ -16,7 +16,7 @@ CSGDB（Context-State-Graph Database）是一套面向终端智能体的本地�
 
 ## 当前状态
 
-CSGDB 已进入 M1。当前代码已经能够创建和重开真实加密 `.db`，执行 SQL，提交或回滚事务，并通过 Rust API 与 C ABI 使用；显式明文模式生成普通兼容数据库。下一切片将继续实现参数绑定、结果行、预编译语句缓存和连接管理。
+CSGDB 已进入 M1。当前代码已经能够创建和重开真实加密 `.db`，执行 SQL，提交或回滚事务，并通过 Rust API 与 C ABI 使用；显式明文模式生成普通兼容数据库。Rust 和 C 接口均已支持预编译语句、五类动态值、参数绑定和流式逐行读取，Rust 连接还提供有界 LRU Statement Cache。下一切片将继续实现连接管理、写入调度和运行时观测。
 
 尚未发布可用于生产环境的版本，也不应将当前设计文档视为已经实现的安全保证。
 
@@ -37,7 +37,10 @@ db.execute_batch(
 )?;
 
 let tx = db.transaction()?;
-tx.execute_batch("INSERT INTO memory(body) VALUES ('first memory');")?;
+tx.execute(
+    "INSERT INTO memory(body) VALUES (?)",
+    &[csgdb::ValueRef::Text("first memory")],
+)?;
 tx.commit()?;
 
 # Ok::<(), csgdb::Error>(())

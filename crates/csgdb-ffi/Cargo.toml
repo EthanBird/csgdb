@@ -16,6 +16,9 @@ doc = false
 [dependencies]
 csgdb-api = { package = "csgdb", path = "../csgdb" }
 csgdb-core = { path = "../csgdb-core" }
+libsqlite3-sys = { version = "0.37.0", features = [
+    "bundled-sqlcipher-vendored-openssl",
+] }
 
 [lints]
 workspace = true

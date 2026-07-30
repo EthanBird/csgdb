@@ -31,6 +31,18 @@ extern "C" {
 #define CSGDB_CONSTRAINT 8
 #define CSGDB_CORRUPT 9
 #define CSGDB_STORAGE 10
+#define CSGDB_MISUSE 11
+#define CSGDB_RANGE 12
+
+#define CSGDB_INTEGER 1
+#define CSGDB_FLOAT 2
+#define CSGDB_TEXT 3
+#define CSGDB_BLOB 4
+#define CSGDB_NULL 5
+#define CSGDB_ROW 100
+#define CSGDB_DONE 101
+
+#define CSGDB_PREPARE_PERSISTENT 0x01u
 
 #define CSGDB_OPEN_READONLY  0x0001u
 #define CSGDB_OPEN_READWRITE 0x0002u
@@ -98,6 +110,95 @@ CSGDB_API int32_t csgdb_open_v3(
     const csgdb_open_options *options
 );
 CSGDB_API int32_t csgdb_exec(csgdb *db, const char *sql);
+CSGDB_API int32_t csgdb_prepare_v2(
+    csgdb *db,
+    const char *sql,
+    int32_t sql_len,
+    csgdb_stmt **out_statement,
+    const char **out_tail
+);
+CSGDB_API int32_t csgdb_prepare_v3(
+    csgdb *db,
+    const char *sql,
+    int32_t sql_len,
+    uint32_t flags,
+    csgdb_stmt **out_statement,
+    const char **out_tail
+);
+CSGDB_API int32_t csgdb_bind_parameter_count(const csgdb_stmt *statement);
+CSGDB_API int32_t csgdb_bind_parameter_index(
+    const csgdb_stmt *statement,
+    const char *name
+);
+CSGDB_API const char *csgdb_bind_parameter_name(
+    const csgdb_stmt *statement,
+    int32_t index
+);
+CSGDB_API int32_t csgdb_bind_null(csgdb_stmt *statement, int32_t index);
+CSGDB_API int32_t csgdb_bind_int(
+    csgdb_stmt *statement,
+    int32_t index,
+    int32_t value
+);
+CSGDB_API int32_t csgdb_bind_int64(
+    csgdb_stmt *statement,
+    int32_t index,
+    int64_t value
+);
+CSGDB_API int32_t csgdb_bind_double(
+    csgdb_stmt *statement,
+    int32_t index,
+    double value
+);
+CSGDB_API int32_t csgdb_bind_text(
+    csgdb_stmt *statement,
+    int32_t index,
+    const char *value,
+    int64_t value_len
+);
+CSGDB_API int32_t csgdb_bind_blob(
+    csgdb_stmt *statement,
+    int32_t index,
+    const void *value,
+    size_t value_len
+);
+CSGDB_API int32_t csgdb_step(csgdb_stmt *statement);
+CSGDB_API int32_t csgdb_reset(csgdb_stmt *statement);
+CSGDB_API int32_t csgdb_clear_bindings(csgdb_stmt *statement);
+CSGDB_API int32_t csgdb_column_count(const csgdb_stmt *statement);
+CSGDB_API const char *csgdb_column_name(
+    const csgdb_stmt *statement,
+    int32_t index
+);
+CSGDB_API int32_t csgdb_column_type(
+    const csgdb_stmt *statement,
+    int32_t index
+);
+CSGDB_API int32_t csgdb_column_int(
+    const csgdb_stmt *statement,
+    int32_t index
+);
+CSGDB_API int64_t csgdb_column_int64(
+    const csgdb_stmt *statement,
+    int32_t index
+);
+CSGDB_API double csgdb_column_double(
+    const csgdb_stmt *statement,
+    int32_t index
+);
+CSGDB_API const unsigned char *csgdb_column_text(
+    const csgdb_stmt *statement,
+    int32_t index
+);
+CSGDB_API const void *csgdb_column_blob(
+    const csgdb_stmt *statement,
+    int32_t index
+);
+CSGDB_API int32_t csgdb_column_bytes(
+    const csgdb_stmt *statement,
+    int32_t index
+);
+CSGDB_API int32_t csgdb_finalize(csgdb_stmt *statement);
 CSGDB_API int32_t csgdb_close(csgdb *db);
 CSGDB_API int32_t csgdb_errcode(const csgdb *db);
 CSGDB_API const char *csgdb_errmsg(const csgdb *db);

@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 static int fail(csgdb *db, const char *operation, int32_t code) {
     fprintf(
@@ -30,11 +31,69 @@ int main(int argc, char **argv) {
 
     rc = csgdb_exec(
         db,
-        "CREATE TABLE smoke(id INTEGER PRIMARY KEY, value TEXT NOT NULL);"
-        "INSERT INTO smoke(value) VALUES ('ffi-ok');"
+        "CREATE TABLE smoke("
+        "id INTEGER PRIMARY KEY,"
+        "value TEXT NOT NULL,"
+        "payload BLOB NOT NULL"
+        ");"
     );
     if (rc != CSGDB_OK) {
         return fail(db, "exec", rc);
+    }
+
+    const char *insert_sql =
+        "INSERT INTO smoke(id, value, payload) VALUES (?, ?, ?)";
+    csgdb_stmt *statement = NULL;
+    rc = csgdb_prepare_v2(db, insert_sql, -1, &statement, NULL);
+    if (rc != CSGDB_OK) {
+        return fail(db, "prepare insert", rc);
+    }
+
+    const unsigned char payload[] = {0, 1, 2, 255};
+    if (csgdb_bind_int64(statement, 1, 7) != CSGDB_OK ||
+        csgdb_bind_text(statement, 2, "ffi-ok", -1) != CSGDB_OK ||
+        csgdb_bind_blob(statement, 3, payload, sizeof(payload)) != CSGDB_OK ||
+        csgdb_step(statement) != CSGDB_DONE) {
+        csgdb_finalize(statement);
+        return fail(db, "bind/insert", csgdb_errcode(db));
+    }
+    rc = csgdb_finalize(statement);
+    if (rc != CSGDB_OK) {
+        return fail(db, "finalize insert", rc);
+    }
+
+    const char *select_sql =
+        "SELECT id, value, payload FROM smoke WHERE id = ?";
+    statement = NULL;
+    rc = csgdb_prepare_v3(
+        db,
+        select_sql,
+        -1,
+        CSGDB_PREPARE_PERSISTENT,
+        &statement,
+        NULL
+    );
+    if (rc != CSGDB_OK || csgdb_bind_int(statement, 1, 7) != CSGDB_OK) {
+        csgdb_finalize(statement);
+        return fail(db, "prepare select", csgdb_errcode(db));
+    }
+    if (csgdb_step(statement) != CSGDB_ROW ||
+        csgdb_column_count(statement) != 3 ||
+        csgdb_column_type(statement, 0) != CSGDB_INTEGER ||
+        csgdb_column_int64(statement, 0) != 7 ||
+        csgdb_column_type(statement, 1) != CSGDB_TEXT ||
+        csgdb_column_bytes(statement, 1) != 6 ||
+        memcmp(csgdb_column_text(statement, 1), "ffi-ok", 6) != 0 ||
+        csgdb_column_type(statement, 2) != CSGDB_BLOB ||
+        csgdb_column_bytes(statement, 2) != (int32_t)sizeof(payload) ||
+        memcmp(csgdb_column_blob(statement, 2), payload, sizeof(payload)) != 0 ||
+        csgdb_step(statement) != CSGDB_DONE) {
+        csgdb_finalize(statement);
+        return fail(db, "select", csgdb_errcode(db));
+    }
+    rc = csgdb_finalize(statement);
+    if (rc != CSGDB_OK) {
+        return fail(db, "finalize select", rc);
     }
 
     rc = csgdb_close(db);

@@ -15,11 +15,15 @@
 - Rust `open/open_with_key/open_with_passphrase/open_plaintext/close`；
 - SQL 批量执行、单整数查询以及显式提交和回滚；
 - C `open/open_v2/open_with_key/open_v3/exec/close/error` 函数族；
+- Rust `Value/ValueRef/Statement/Rows/Row`、严格类型读取和精确参数数量校验；
+- Rust 连接本地有界 LRU Prepared Statement Cache；
+- C `prepare/bind/step/column/reset/clear_bindings/finalize` 函数族；
+- C Statement 状态机、越界检查和延迟连接关闭；
 - 加密文件头、正确密钥重开、错误密钥拒绝和明文兼容测试；
 - 经实际构建验证的 Rust 1.82 最低工具链；
 - 格式、Clippy、测试、文档和 C 头文件检查的 CI。
 
-当前仍是开发版本。尚未完成参数绑定、通用结果行、预编译语句缓存、读连接池、写入调度器、平台密钥库适配和断电故障注入。下一切片优先完成 Statement/Value/Row API 与 C 绑定接口。
+当前仍是开发版本。尚未完成读连接池、写入调度器、平台密钥库适配、Checkpoint 管理、变更计数和断电故障注入。下一切片优先完成连接管理、写入调度、取消和基础观测接口。
 
 ## M0：规格与工程骨架
 

@@ -6,10 +6,14 @@
 pub use csgdb_core::{
     prepare_open, DatabaseIdentity, Error, ErrorCode, KeyProvider, KeySource, OpenFlags,
     OpenOptions, OpenPlan, ResolvedKeyRef, ResolvedOpenPlan, Result, SecretKey, SecretString,
-    SecurityMode, ABI_VERSION, LIB_VERSION, LIB_VERSION_NUMBER, RAW_KEY_LENGTH, SOURCE_ID,
+    SecurityMode, Value, ValueRef, ValueType, ABI_VERSION, LIB_VERSION, LIB_VERSION_NUMBER,
+    RAW_KEY_LENGTH, SOURCE_ID,
 };
-pub use csgdb_storage::Transaction;
+pub use csgdb_storage::{
+    Row, Rows, Statement, Transaction, DEFAULT_PREPARED_STATEMENT_CACHE_CAPACITY,
+};
 
+use std::ffi::c_void;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -160,13 +164,45 @@ impl Database {
         self.connection.execute_batch(sql)
     }
 
-    /// Executes one SQL statement without bound parameters.
+    /// Executes one SQL statement with positional parameters.
     ///
     /// # Errors
     ///
     /// Returns an error when the statement fails or returns rows.
-    pub fn execute(&self, sql: &str) -> Result<usize> {
-        self.connection.execute(sql)
+    pub fn execute(&self, sql: &str, parameters: &[ValueRef<'_>]) -> Result<usize> {
+        self.connection.execute(sql, parameters)
+    }
+
+    /// Compiles a SQL statement.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the SQL cannot be compiled.
+    pub fn prepare(&self, sql: &str) -> Result<Statement<'_>> {
+        self.connection.prepare(sql)
+    }
+
+    /// Compiles a SQL statement through the bounded connection-local LRU
+    /// cache. Dropping the statement returns it to the cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the SQL cannot be compiled.
+    pub fn prepare_cached(&self, sql: &str) -> Result<Statement<'_>> {
+        self.connection.prepare_cached(sql)
+    }
+
+    /// Changes the maximum number of idle compiled statements retained by the
+    /// connection-local LRU cache.
+    pub fn set_prepared_statement_cache_capacity(&self, capacity: usize) {
+        self.connection
+            .set_prepared_statement_cache_capacity(capacity);
+    }
+
+    /// Finalizes every idle statement currently held by this connection's
+    /// cache.
+    pub fn flush_prepared_statement_cache(&self) {
+        self.connection.flush_prepared_statement_cache();
     }
 
     /// Reads a single integer value.
@@ -195,6 +231,20 @@ impl Database {
     /// Returns an error when the underlying database cannot be closed.
     pub fn close(self) -> Result<()> {
         self.connection.close()
+    }
+
+    /// Returns the underlying SQL connection pointer for the C ABI crate.
+    ///
+    /// # Safety
+    ///
+    /// This is an internal integration boundary. The pointer must not outlive
+    /// the database, must not be closed, and all uses must be serialized with
+    /// safe operations on this database.
+    #[doc(hidden)]
+    pub unsafe fn as_raw_handle(&self) -> *mut c_void {
+        // SAFETY: the caller accepts the documented lifetime and
+        // synchronization requirements.
+        unsafe { self.connection.as_raw_handle() }
     }
 }
 
@@ -362,5 +412,138 @@ mod tests {
         let error = Database::open(path.path()).expect_err("missing provider must fail");
         assert_eq!(error.code(), ErrorCode::KeyStoreUnavailable);
         assert!(!path.path().exists());
+    }
+
+    #[test]
+    fn prepared_statements_bind_and_stream_every_value_type() {
+        let path = TestDatabasePath::new("prepared-values");
+        let database =
+            Database::open_with_key(path.path(), test_key(21)).expect("open encrypted database");
+        database
+            .execute_batch(
+                "CREATE TABLE value_set(
+                    id INTEGER PRIMARY KEY,
+                    score REAL NOT NULL,
+                    body TEXT NOT NULL,
+                    payload BLOB NOT NULL,
+                    optional TEXT
+                );",
+            )
+            .expect("create table");
+
+        let payload = [0_u8, 1, 2, 255];
+        assert_eq!(
+            database
+                .execute(
+                    "INSERT INTO value_set(id, score, body, payload, optional)
+                     VALUES (?, ?, ?, ?, ?)",
+                    &[
+                        ValueRef::Integer(42),
+                        ValueRef::Real(3.25),
+                        ValueRef::Text("agent memory"),
+                        ValueRef::Blob(&payload),
+                        ValueRef::Null,
+                    ],
+                )
+                .expect("insert bound values"),
+            1
+        );
+
+        let mut statement = database
+            .prepare_cached(
+                "SELECT id, score, body, payload, optional
+                 FROM value_set WHERE id = ?",
+            )
+            .expect("prepare cached query");
+        assert_eq!(statement.parameter_count(), 1);
+        assert_eq!(statement.column_count(), 5);
+        assert_eq!(statement.column_name(2).expect("column name"), "body");
+
+        let mut rows = statement
+            .query(&[ValueRef::Integer(42)])
+            .expect("bind query");
+        {
+            let row = rows.next_row().expect("advance query").expect("one row");
+            assert_eq!(row.column_count(), 5);
+            assert_eq!(row.get_i64(0).expect("integer"), 42);
+            assert!((row.get_f64(1).expect("real") - 3.25).abs() < f64::EPSILON);
+            assert_eq!(row.get_text(2).expect("text"), "agent memory");
+            assert_eq!(row.get_blob(3).expect("blob"), payload);
+            assert_eq!(row.value(4).expect("null"), Value::Null);
+            assert_eq!(row.value_type(4).expect("null type"), ValueType::Null);
+        }
+        assert!(rows.next_row().expect("finish query").is_none());
+    }
+
+    #[test]
+    fn prepared_statements_report_binding_and_column_errors() {
+        let path = TestDatabasePath::new("prepared-errors");
+        let database =
+            Database::open_with_key(path.path(), test_key(22)).expect("open encrypted database");
+
+        let mut statement = database.prepare("SELECT ?, ?").expect("prepare");
+        let Err(error) = statement.query(&[ValueRef::Integer(1)]) else {
+            panic!("parameter mismatch must fail");
+        };
+        assert_eq!(error.code(), ErrorCode::ParameterCountMismatch);
+
+        let mut rows = statement
+            .query(&[ValueRef::Integer(1), ValueRef::Text("two")])
+            .expect("query");
+        let row = rows.next_row().expect("advance").expect("one row");
+        assert_eq!(
+            row.get_text(0).expect_err("strict type mismatch").code(),
+            ErrorCode::InvalidColumnType
+        );
+        assert_eq!(
+            row.value(2).expect_err("column range").code(),
+            ErrorCode::InvalidColumnIndex
+        );
+    }
+
+    #[test]
+    fn invalid_utf8_text_is_rejected_without_affecting_blob_reads() {
+        let path = TestDatabasePath::new("invalid-utf8");
+        let database =
+            Database::open_with_key(path.path(), test_key(23)).expect("open encrypted database");
+        let mut statement = database
+            .prepare("SELECT CAST(x'80ff' AS TEXT), x'80ff'")
+            .expect("prepare");
+        let mut rows = statement.query(&[]).expect("query");
+        let row = rows.next_row().expect("advance").expect("one row");
+
+        assert_eq!(
+            row.get_text(0).expect_err("invalid UTF-8").code(),
+            ErrorCode::InvalidUtf8
+        );
+        assert_eq!(row.get_blob(1).expect("blob remains binary"), [0x80, 0xff]);
+    }
+
+    #[test]
+    fn transaction_supports_bound_statements() {
+        let path = TestDatabasePath::new("transaction-bind");
+        let mut database =
+            Database::open_with_key(path.path(), test_key(24)).expect("open encrypted database");
+        database
+            .execute_batch("CREATE TABLE item(value TEXT NOT NULL);")
+            .expect("create table");
+
+        let transaction = database.transaction().expect("begin transaction");
+        assert_eq!(
+            transaction
+                .execute(
+                    "INSERT INTO item(value) VALUES (?)",
+                    &[ValueRef::Text("committed")],
+                )
+                .expect("bound insert"),
+            1
+        );
+        transaction.commit().expect("commit");
+        assert_eq!(
+            database
+                .query_i64("SELECT count(*) FROM item")
+                .expect("count"),
+            1
+        );
     }
 }

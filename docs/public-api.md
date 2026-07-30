@@ -257,7 +257,7 @@ file:agent.db?mode=ro&csg_key_id=device
 
 ## 7. SQL 执行接口
 
-当前已经实现 `csgdb_exec`。本节其余 Statement、Bind、Step 和 Column 函数是 M1 下一切片的稳定接口目标。
+当前已经实现 `csgdb_exec`、Statement、Bind、Step、Column、Reset 和 Finalize。接口保持逐行读取，不会把完整结果集无界物化到内存。
 
 ```c
 csgdb_stmt *stmt = NULL;
@@ -271,37 +271,50 @@ csgdb_prepare_v3(
     NULL
 );
 
-csgdb_bind_text(stmt, 1, agent_id, -1, CSGDB_TRANSIENT);
+csgdb_bind_text(stmt, 1, agent_id, -1);
 
 while (csgdb_step(stmt) == CSGDB_ROW) {
     int64_t id = csgdb_column_int64(stmt, 0);
-    const char *text = csgdb_column_text(stmt, 1);
+    const unsigned char *text = csgdb_column_text(stmt, 1);
 }
 
 csgdb_finalize(stmt);
 ```
 
-首批稳定函数族：
+当前已实现：
 
 ```text
 csgdb_exec
 csgdb_prepare_v2 / csgdb_prepare_v3
 
+csgdb_bind_parameter_count / index / name
 csgdb_bind_null / int / int64 / double / text / blob
 
 csgdb_step / reset / clear_bindings / finalize
 
 csgdb_column_count / name / type
-csgdb_column_int64 / double / text / blob / bytes
+csgdb_column_int / int64 / double / text / blob / bytes
+
+csgdb_errcode / errmsg / errstr
+csgdb_close
+```
+
+后续兼容切片：
+
+```text
 
 csgdb_changes / total_changes / last_insert_rowid
 csgdb_busy_timeout / interrupt
 
-csgdb_errcode / extended_errcode / errmsg
-csgdb_close / close_v2
+csgdb_extended_errcode
+csgdb_close_v2
 ```
 
 参数从 1 开始编号，结果列从 0 开始编号。UTF-8 是主文本接口；需要 UTF-16 时通过独立兼容层提供。
+
+`csgdb_bind_text` 和 `csgdb_bind_blob` 在返回前复制调用方数据。Column 返回的文本和 Blob 指针仅在当前 Row 有效；下一次 `step`、`reset` 或 `finalize` 会使其失效。Statement 到达 `DONE` 或错误状态后必须先 `reset` 才能再次执行。
+
+关闭数据库句柄时，如果还有 Statement 存活，连接关闭会延后到最后一个 Statement 完成 `finalize`。调用方仍必须对同一 Statement 的访问进行串行化。
 
 ## 8. Rust API
 
@@ -345,20 +358,52 @@ let db = Database::open_with_passphrase("portable.db", secret)?;
 
 ```rust
 let tx = db.transaction()?;
-tx.execute_batch(
-    "INSERT INTO event(kind, payload) VALUES ('tool', X'0102');
-     UPDATE state SET revision = revision + 1 WHERE id = 1;",
+tx.execute(
+    "INSERT INTO event(kind, payload) VALUES (?, ?)",
+    &[
+        ValueRef::Text("tool"),
+        ValueRef::Blob(&[1, 2]),
+    ],
 )?;
 tx.commit()?;
 ```
 
-参数绑定、通用行读取和 Statement Cache 正在实现。线程和生命周期目标：
+参数绑定和流式行读取：
+
+```rust
+use csgdb::{Database, ValueRef, ValueType};
+
+let db = Database::open_with_passphrase("agent.db", secret)?;
+
+db.execute(
+    "INSERT INTO memory(agent_id, text) VALUES (?, ?)",
+    &[
+        ValueRef::Text(agent_id),
+        ValueRef::Text("first memory"),
+    ],
+)?;
+
+let mut statement = db.prepare_cached(
+    "SELECT id, text FROM memory WHERE agent_id = ? ORDER BY id",
+)?;
+let mut rows = statement.query(&[ValueRef::Text(agent_id)])?;
+
+while let Some(row) = rows.next_row()? {
+    assert_eq!(row.value_type(0)?, ValueType::Integer);
+    let id = row.get_i64(0)?;
+    let text = row.get_text(1)?;
+    consume(id, text);
+}
+```
+
+`Value` 是拥有所有权的动态值，`ValueRef` 用于低开销绑定或借用当前行。严格 getter 不做跨类型隐式转换；例如对 TEXT 调用 `get_i64` 会返回 `InvalidColumnType`。
+
+`prepare_cached` 使用连接本地、有容量上限的 LRU Cache，默认最多保留 16 条闲置语句；`set_prepared_statement_cache_capacity` 可调整上限，`flush_prepared_statement_cache` 可立即清空。`prepare` 则总是直接编译。线程和生命周期约束由 Rust 类型系统表达：
 
 ```text
-Database: Send + Sync
-Statement<'db>: Send + !Sync
-Transaction<'db>: !Send + !Sync
+Statement<'db>: 不能比 Database 存活更久
 Row<'stmt>: borrowed
+Rows::next_row: 推进后使上一个 Row 借用失效
 ```
 
 异步接口通过专用数据库工作线程实现，不要求底层文件 I/O 伪装成异步操作。
@@ -417,31 +462,30 @@ libcsgdb_sqlite3_compat
 
 ## 11. 错误码
 
-基础错误：
+当前 C ABI：
 
 ```text
-OK
-ERROR
-BUSY
-LOCKED
-READONLY
-INTERRUPT
-IOERR
-CORRUPT
-CONSTRAINT
-NOTADB
-ROW
-DONE
+OK                         0
+INVALID_ARGUMENT           1
+INVALID_OPEN_FLAGS         2
+INVALID_KEY                3
+KEY_REQUIRED               4
+KEYSTORE_UNAVAILABLE       5
+BUSY                       6
+READONLY                   7
+CONSTRAINT                 8
+CORRUPT                    9
+STORAGE                   10
+MISUSE                    11
+RANGE                     12
+ROW                      100
+DONE                     101
 ```
 
-扩展错误：
+后续扩展错误候选：
 
 ```text
-KEY_REQUIRED
-BAD_KEY
-KEYSTORE_UNAVAILABLE
 PLAINTEXT_REQUIRES_OPT_IN
-INVALID_OPEN_FLAGS
 AUTH_DENIED
 BUDGET_EXCEEDED
 VECTOR_MODEL_MISMATCH
@@ -449,7 +493,7 @@ INDEX_REBUILD_REQUIRED
 MIGRATION_INCOMPLETE
 ```
 
-基础错误用于通用处理，扩展错误用于精确诊断。C ABI 的错误数字一经稳定发布，不再重排。
+`MISUSE` 表示语句状态不允许当前操作，`RANGE` 表示参数或结果列索引越界。C ABI 的错误数字一经稳定发布，不再重排。
 
 ## 12. 版本与兼容承诺
 

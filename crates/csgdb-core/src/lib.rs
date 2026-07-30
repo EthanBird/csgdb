@@ -7,6 +7,7 @@
 mod error;
 mod key;
 mod open;
+mod value;
 mod version;
 
 pub use error::{Error, ErrorCode, Result};
@@ -15,4 +16,5 @@ pub use open::{
     prepare_open, OpenFlags, OpenOptions, OpenPlan, ResolvedKeyRef, ResolvedOpenPlan, SecurityMode,
     DEFAULT_BUSY_TIMEOUT_MS, DEFAULT_CACHE_SIZE_BYTES, DEFAULT_MEMORY_BUDGET_BYTES,
 };
+pub use value::{Value, ValueRef, ValueType};
 pub use version::{ABI_VERSION, LIB_VERSION, LIB_VERSION_NUMBER, SOURCE_ID};
