@@ -1,0 +1,78 @@
+#ifndef CSGDB_H
+#define CSGDB_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#if defined(_WIN32) && defined(CSGDB_BUILD_SHARED)
+#define CSGDB_API __declspec(dllexport)
+#elif defined(_WIN32)
+#define CSGDB_API __declspec(dllimport)
+#elif defined(__GNUC__) || defined(__clang__)
+#define CSGDB_API __attribute__((visibility("default")))
+#else
+#define CSGDB_API
+#endif
+
+#define CSGDB_ABI_VERSION 1u
+
+#define CSGDB_OK 0
+#define CSGDB_INVALID_ARGUMENT 1
+
+#define CSGDB_OPEN_READONLY  0x0001u
+#define CSGDB_OPEN_READWRITE 0x0002u
+#define CSGDB_OPEN_CREATE    0x0004u
+#define CSGDB_OPEN_URI       0x0008u
+#define CSGDB_OPEN_MEMORY    0x0010u
+#define CSGDB_OPEN_ENCRYPTED 0x0020u
+#define CSGDB_OPEN_PLAINTEXT 0x0040u
+#define CSGDB_OPEN_FULLMUTEX 0x0080u
+#define CSGDB_OPEN_NOMUTEX   0x0100u
+#define CSGDB_OPEN_NOFOLLOW  0x0200u
+
+#define CSGDB_KEY_AUTO       0u
+#define CSGDB_KEY_RAW        1u
+#define CSGDB_KEY_PASSPHRASE 2u
+#define CSGDB_KEY_PROVIDER   3u
+
+typedef struct csgdb csgdb;
+typedef struct csgdb_stmt csgdb_stmt;
+typedef struct csgdb_value csgdb_value;
+typedef struct csgdb_backup csgdb_backup;
+
+typedef struct csgdb_key_source {
+    uint32_t struct_size;
+    uint32_t kind;
+    const void *data;
+    size_t data_len;
+    const char *provider_id;
+} csgdb_key_source;
+
+typedef struct csgdb_open_options {
+    uint32_t struct_size;
+    uint32_t abi_version;
+    uint32_t flags;
+    uint32_t busy_timeout_ms;
+    uint64_t cache_size_bytes;
+    uint64_t memory_budget_bytes;
+    const char *vfs;
+    const char *device_profile;
+    csgdb_key_source key;
+} csgdb_open_options;
+
+CSGDB_API const char *csgdb_libversion(void);
+CSGDB_API uint32_t csgdb_libversion_number(void);
+CSGDB_API uint32_t csgdb_abi_version(void);
+CSGDB_API const char *csgdb_source_id(void);
+CSGDB_API uint32_t csgdb_default_open_flags(void);
+CSGDB_API int32_t csgdb_open_options_init(csgdb_open_options *out_options);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif

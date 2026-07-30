@@ -1,0 +1,15 @@
+[package]
+name = "csgdb"
+description = "Rust API for the CSGDB embedded agent database"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+csgdb-core = { path = "../csgdb-core" }
+
+[lints]
+workspace = true

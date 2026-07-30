@@ -1,0 +1,18 @@
+[package]
+name = "csgdb-ffi"
+description = "Stable C ABI for CSGDB"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+csgdb-core = { path = "../csgdb-core" }
+
+[lints]
+workspace = true

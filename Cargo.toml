@@ -1,0 +1,23 @@
+[workspace]
+members = [
+    "crates/csgdb",
+    "crates/csgdb-cli",
+    "crates/csgdb-core",
+    "crates/csgdb-ffi",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.78"
+license = "MIT"
+authors = ["EthanBird"]
+repository = "https://github.com/EthanBird/csgdb"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = "deny"
+pedantic = "warn"
