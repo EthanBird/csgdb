@@ -49,6 +49,13 @@ agent.db.blobs/
 
 ## 3. 默认打开行为
 
+当前开发版本已经实现默认加密策略，但尚未内置各平台的系统密钥库适配。因此：
+
+- `Database::open` / `csgdb_open` 在已配置 KeyProvider 时可直接使用；
+- 没有 KeyProvider 时返回 `KEYSTORE_UNAVAILABLE`，不会创建明文文件；
+- 当前可立即使用 `open_with_key`、`open_with_passphrase` 或显式明文接口；
+- 后续平台 SDK 将把默认系统密钥库适配注入 `KEY_AUTO`。
+
 最简单的 C 接口：
 
 ```c
@@ -250,6 +257,8 @@ file:agent.db?mode=ro&csg_key_id=device
 
 ## 7. SQL 执行接口
 
+当前已经实现 `csgdb_exec`。本节其余 Statement、Bind、Step 和 Column 函数是 M1 下一切片的稳定接口目标。
+
 ```c
 csgdb_stmt *stmt = NULL;
 
@@ -296,71 +305,54 @@ csgdb_close / close_v2
 
 ## 8. Rust API
 
-普通 SQL：
+当前可运行接口：
 
 ```rust
-let db = Database::open("agent.db")?;
+let mut db = Database::open_with_passphrase(
+    "agent.db",
+    "replace-with-a-secret",
+)?;
 
-db.execute(
+db.execute_batch(
     "CREATE TABLE IF NOT EXISTS memory (
         id INTEGER PRIMARY KEY,
-        agent_id TEXT NOT NULL,
         text TEXT NOT NULL
-    )",
-    (),
+    );",
 )?;
 
-db.execute(
-    "INSERT INTO memory(agent_id, text) VALUES (?, ?)",
-    params![agent_id, text],
-)?;
+let tx = db.transaction()?;
+tx.execute_batch("INSERT INTO memory(text) VALUES ('first memory');")?;
+tx.commit()?;
 
-let memories = db
-    .prepare("SELECT id, text FROM memory WHERE agent_id = ?")?
-    .query_map(params![agent_id], |row| {
-        Ok(Memory {
-            id: row.get(0)?,
-            text: row.get(1)?,
-        })
-    })?
-    .collect::<Result<Vec<_>>>()?;
+assert_eq!(db.query_i64("SELECT count(*) FROM memory")?, 1);
 ```
 
 显式密钥：
 
 ```rust
 let db = Database::builder("portable.db")
-    .key(KeySource::raw(key))
+    .key(KeySource::Raw(SecretKey::from_slice(&key)?))
     .open()?;
 ```
 
 密码：
 
 ```rust
-let db = Database::builder("portable.db")
-    .key(KeySource::passphrase(secret))
-    .open()?;
+let db = Database::open_with_passphrase("portable.db", secret)?;
 ```
 
 事务：
 
 ```rust
-db.transaction(|tx| {
-    tx.execute(
-        "INSERT INTO event(kind, payload) VALUES (?, ?)",
-        params![kind, payload],
-    )?;
-
-    tx.execute(
-        "UPDATE state SET revision = revision + 1 WHERE id = ?",
-        params![state_id],
-    )?;
-
-    Ok(())
-})?;
+let tx = db.transaction()?;
+tx.execute_batch(
+    "INSERT INTO event(kind, payload) VALUES ('tool', X'0102');
+     UPDATE state SET revision = revision + 1 WHERE id = 1;",
+)?;
+tx.commit()?;
 ```
 
-线程和生命周期目标：
+参数绑定、通用行读取和 Statement Cache 正在实现。线程和生命周期目标：
 
 ```text
 Database: Send + Sync

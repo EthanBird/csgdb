@@ -55,9 +55,9 @@ pub struct SecretString {
 
 impl SecretString {
     #[must_use]
-    pub fn new(value: impl Into<Vec<u8>>) -> Self {
+    pub fn new(value: impl AsRef<[u8]>) -> Self {
         Self {
-            bytes: value.into(),
+            bytes: value.as_ref().to_vec(),
         }
     }
 
@@ -196,7 +196,7 @@ mod tests {
     #[test]
     fn secrets_are_redacted_from_debug() {
         let key = SecretKey::from_slice(&[7_u8; RAW_KEY_LENGTH]).expect("valid key");
-        let passphrase = SecretString::new(b"do not print me".to_vec());
+        let passphrase = SecretString::new(b"do not print me");
 
         assert_eq!(format!("{key:?}"), "SecretKey([REDACTED])");
         assert_eq!(format!("{passphrase:?}"), "SecretString([REDACTED])");

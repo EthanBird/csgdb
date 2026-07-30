@@ -16,6 +16,17 @@ pub const DEFAULT_MEMORY_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
 pub struct OpenFlags(u32);
 
 impl OpenFlags {
+    const ALL_BITS: u32 = Self::READONLY.0
+        | Self::READWRITE.0
+        | Self::CREATE.0
+        | Self::URI.0
+        | Self::MEMORY.0
+        | Self::ENCRYPTED.0
+        | Self::PLAINTEXT.0
+        | Self::FULLMUTEX.0
+        | Self::NOMUTEX.0
+        | Self::NOFOLLOW.0;
+
     pub const READONLY: Self = Self(0x0001);
     pub const READWRITE: Self = Self(0x0002);
     pub const CREATE: Self = Self(0x0004);
@@ -45,6 +56,15 @@ impl OpenFlags {
     #[must_use]
     pub const fn intersects(self, other: Self) -> bool {
         (self.0 & other.0) != 0
+    }
+
+    #[must_use]
+    pub const fn from_bits(bits: u32) -> Option<Self> {
+        if bits & !Self::ALL_BITS == 0 {
+            Some(Self(bits))
+        } else {
+            None
+        }
     }
 }
 
@@ -212,7 +232,28 @@ pub struct ResolvedOpenPlan {
     busy_timeout: Duration,
     cache_size_bytes: u64,
     memory_budget_bytes: u64,
-    key: Option<SecretKey>,
+    key: Option<ResolvedKey>,
+}
+
+/// Borrowed key material exposed only to a storage backend.
+#[derive(Clone, Copy)]
+pub enum ResolvedKeyRef<'key> {
+    Raw(&'key [u8; 32]),
+    Passphrase(&'key [u8]),
+}
+
+impl fmt::Debug for ResolvedKeyRef<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Raw(_) => formatter.write_str("ResolvedKeyRef::Raw([REDACTED])"),
+            Self::Passphrase(_) => formatter.write_str("ResolvedKeyRef::Passphrase([REDACTED])"),
+        }
+    }
+}
+
+enum ResolvedKey {
+    Raw(SecretKey),
+    Passphrase(SecretString),
 }
 
 impl ResolvedOpenPlan {
@@ -251,9 +292,14 @@ impl ResolvedOpenPlan {
         self.key.is_some()
     }
 
-    pub fn with_key<R>(&self, operation: impl FnOnce(Option<&[u8; 32]>) -> R) -> R {
+    pub fn with_key<R>(&self, operation: impl FnOnce(Option<ResolvedKeyRef<'_>>) -> R) -> R {
         match &self.key {
-            Some(key) => key.with_exposed(|bytes| operation(Some(bytes))),
+            Some(ResolvedKey::Raw(key)) => {
+                key.with_exposed(|bytes| operation(Some(ResolvedKeyRef::Raw(bytes))))
+            }
+            Some(ResolvedKey::Passphrase(passphrase)) => {
+                passphrase.with_exposed(|bytes| operation(Some(ResolvedKeyRef::Passphrase(bytes))))
+            }
             None => operation(None),
         }
     }
@@ -340,12 +386,20 @@ fn resolve_encrypted_key(
     flags: OpenFlags,
     key_source: KeySource,
     auto_provider: Option<Arc<dyn KeyProvider>>,
-) -> Result<SecretKey> {
+) -> Result<ResolvedKey> {
     match key_source {
-        KeySource::Raw(key) => Ok(key),
-        KeySource::Passphrase(passphrase) => derive_passphrase_key(&passphrase),
+        KeySource::Raw(key) => Ok(ResolvedKey::Raw(key)),
+        KeySource::Passphrase(passphrase) => {
+            if passphrase.with_exposed(<[u8]>::is_empty) {
+                return Err(Error::new(
+                    ErrorCode::InvalidKeyLength,
+                    "database passphrase must not be empty",
+                ));
+            }
+            Ok(ResolvedKey::Passphrase(passphrase))
+        }
         KeySource::Provider { provider, .. } => {
-            load_or_create_key(provider.as_ref(), identity, flags)
+            load_or_create_key(provider.as_ref(), identity, flags).map(ResolvedKey::Raw)
         }
         KeySource::Auto => {
             let provider = auto_provider.ok_or_else(|| {
@@ -354,7 +408,7 @@ fn resolve_encrypted_key(
                     "encrypted open requires a configured key provider",
                 )
             })?;
-            load_or_create_key(provider.as_ref(), identity, flags)
+            load_or_create_key(provider.as_ref(), identity, flags).map(ResolvedKey::Raw)
         }
     }
 }
@@ -373,14 +427,6 @@ fn load_or_create_key(
     Err(Error::new(
         ErrorCode::KeyRequired,
         "no key exists for the encrypted database",
-    ))
-}
-
-fn derive_passphrase_key(passphrase: &SecretString) -> Result<SecretKey> {
-    passphrase.with_exposed(|_| ());
-    Err(Error::new(
-        ErrorCode::EncryptionBackendUnavailable,
-        "passphrase KDF is not available in the M0 implementation",
     ))
 }
 
@@ -510,5 +556,38 @@ mod tests {
             .resolve_key()
             .expect("plaintext does not need a provider");
         assert!(!resolved.has_key());
+    }
+
+    #[test]
+    fn passphrase_is_resolved_without_exposing_it() {
+        let options = OpenOptions {
+            key: KeySource::Passphrase(SecretString::new("correct horse battery staple")),
+            ..OpenOptions::default()
+        };
+        let resolved = prepare_open("agent.db", options)
+            .expect("valid plan")
+            .resolve_key()
+            .expect("passphrase resolves");
+        let kind = resolved.with_key(|key| match key {
+            Some(ResolvedKeyRef::Passphrase(bytes)) => {
+                assert_eq!(bytes.len(), 28);
+                "passphrase"
+            }
+            _ => "other",
+        });
+        assert_eq!(kind, "passphrase");
+    }
+
+    #[test]
+    fn empty_passphrase_is_rejected() {
+        let options = OpenOptions {
+            key: KeySource::Passphrase(SecretString::new([])),
+            ..OpenOptions::default()
+        };
+        let error = prepare_open("agent.db", options)
+            .expect("valid plan")
+            .resolve_key()
+            .expect_err("empty passphrase must fail");
+        assert_eq!(error.code(), ErrorCode::InvalidKeyLength);
     }
 }

@@ -4,13 +4,14 @@ members = [
     "crates/csgdb-cli",
     "crates/csgdb-core",
     "crates/csgdb-ffi",
+    "crates/csgdb-storage",
 ]
 resolver = "2"
 
 [workspace.package]
 version = "0.0.1"
 edition = "2021"
-rust-version = "1.78"
+rust-version = "1.82"
 license = "MIT"
 authors = ["EthanBird"]
 repository = "https://github.com/EthanBird/csgdb"

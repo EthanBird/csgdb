@@ -9,9 +9,12 @@ authors.workspace = true
 repository.workspace = true
 
 [lib]
-crate-type = ["cdylib", "staticlib", "rlib"]
+name = "csgdb"
+crate-type = ["cdylib", "staticlib"]
+doc = false
 
 [dependencies]
+csgdb-api = { package = "csgdb", path = "../csgdb" }
 csgdb-core = { path = "../csgdb-core" }
 
 [lints]

@@ -13,6 +13,12 @@ pub enum ErrorCode {
     PlaintextRequiresOptIn,
     EncryptionBackendUnavailable,
     StorageBackendUnavailable,
+    DatabaseBusy,
+    DatabaseReadOnly,
+    ConstraintViolation,
+    InvalidDatabaseKey,
+    DatabaseCorrupt,
+    Storage,
 }
 
 /// CSGDB error with a stable category and a non-sensitive diagnostic.

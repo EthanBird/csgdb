@@ -1,16 +1,19 @@
 [package]
-name = "csgdb"
-description = "Rust API for the CSGDB embedded agent database"
+name = "csgdb-storage"
+description = "Transaction kernel adapter for CSGDB"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+publish = false
 
 [dependencies]
 csgdb-core = { path = "../csgdb-core" }
-csgdb-storage = { path = "../csgdb-storage" }
+rusqlite = { version = "0.39.0", default-features = false, features = [
+    "bundled-sqlcipher-vendored-openssl",
+] }
 
 [lints]
 workspace = true

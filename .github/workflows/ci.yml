@@ -24,3 +24,17 @@ jobs:
         run: cargo test --workspace --all-features
       - name: Documentation
         run: cargo doc --workspace --no-deps
+      - name: Minimum Rust version
+        run: |
+          rustup toolchain install 1.82.0 --profile minimal
+          cargo +1.82.0 check --workspace --all-features --locked
+      - name: C header
+        run: cc -x c -std=c11 -Wall -Wextra -Werror -fsyntax-only -Iinclude -include csgdb.h /dev/null
+      - name: C ABI smoke test
+        run: |
+          cargo build -p csgdb-ffi
+          cc -std=c11 -Wall -Wextra -Werror tests/c/ffi_smoke.c \
+            -Iinclude -Ltarget/debug -lcsgdb \
+            -Wl,-rpath,"$PWD/target/debug" \
+            -o target/csgdb-ffi-smoke
+          target/csgdb-ffi-smoke "$RUNNER_TEMP/csgdb-ffi-smoke.db"

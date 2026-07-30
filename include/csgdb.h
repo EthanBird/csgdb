@@ -22,6 +22,15 @@ extern "C" {
 
 #define CSGDB_OK 0
 #define CSGDB_INVALID_ARGUMENT 1
+#define CSGDB_INVALID_OPEN_FLAGS 2
+#define CSGDB_INVALID_KEY 3
+#define CSGDB_KEY_REQUIRED 4
+#define CSGDB_KEYSTORE_UNAVAILABLE 5
+#define CSGDB_BUSY 6
+#define CSGDB_READONLY 7
+#define CSGDB_CONSTRAINT 8
+#define CSGDB_CORRUPT 9
+#define CSGDB_STORAGE 10
 
 #define CSGDB_OPEN_READONLY  0x0001u
 #define CSGDB_OPEN_READWRITE 0x0002u
@@ -70,6 +79,29 @@ CSGDB_API uint32_t csgdb_abi_version(void);
 CSGDB_API const char *csgdb_source_id(void);
 CSGDB_API uint32_t csgdb_default_open_flags(void);
 CSGDB_API int32_t csgdb_open_options_init(csgdb_open_options *out_options);
+CSGDB_API int32_t csgdb_open(const char *path, csgdb **out_db);
+CSGDB_API int32_t csgdb_open_v2(
+    const char *path,
+    csgdb **out_db,
+    uint32_t flags,
+    const char *vfs
+);
+CSGDB_API int32_t csgdb_open_with_key(
+    const char *path,
+    const void *key,
+    size_t key_len,
+    csgdb **out_db
+);
+CSGDB_API int32_t csgdb_open_v3(
+    const char *path,
+    csgdb **out_db,
+    const csgdb_open_options *options
+);
+CSGDB_API int32_t csgdb_exec(csgdb *db, const char *sql);
+CSGDB_API int32_t csgdb_close(csgdb *db);
+CSGDB_API int32_t csgdb_errcode(const csgdb *db);
+CSGDB_API const char *csgdb_errmsg(const csgdb *db);
+CSGDB_API const char *csgdb_errstr(int32_t code);
 
 #ifdef __cplusplus
 }

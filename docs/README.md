@@ -11,7 +11,8 @@
 5. [存储、安全与恢复](storage-security.md)：存储内核、加密、迁移、备份和修复。
 6. [嵌入式与性能设计](embedded-performance.md)：设备档位、缓存、索引和基准。
 7. [测试与发布门槛](testing.md)：正确性、安全、兼容性和性能验证。
-8. [开发路线](development-plan.md)：里程碑、依赖和完成定义。
+8. [构建基线](build-baseline.md)：已验证工具链、构建时间和产物大小。
+9. [开发路线](development-plan.md)：里程碑、依赖和完成定义。
 
 ## 文档规范
 

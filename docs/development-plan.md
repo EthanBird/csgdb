@@ -6,15 +6,20 @@
 
 ## 当前进度
 
-当前处于 M0。首批工程代码已经完成：
+当前处于 M1。已经完成：
 
 - Rust Workspace 和 `csgdb`、`csgdb-core`、`csgdb-ffi`、`csgdb-cli` crate；
 - 默认加密、显式明文、冲突标志拒绝和失败关闭策略；
 - 原始密钥、口令和平台密钥提供器的公共抽象；
-- 版本查询、默认打开选项初始化的 C ABI 与公共头文件；
+- SQLCipher 事务内核适配和真实 `.db` 文件读写；
+- Rust `open/open_with_key/open_with_passphrase/open_plaintext/close`；
+- SQL 批量执行、单整数查询以及显式提交和回滚；
+- C `open/open_v2/open_with_key/open_v3/exec/close/error` 函数族；
+- 加密文件头、正确密钥重开、错误密钥拒绝和明文兼容测试；
+- 经实际构建验证的 Rust 1.82 最低工具链；
 - 格式、Clippy、测试、文档和 C 头文件检查的 CI。
 
-这一切片只建立可验证的公共边界，不包含事务存储、数据库文件读写或生产级加密实现。下一切片进入 M1：确定事务内核适配层，贯通 `open/close`，建立最小事务和故障注入测试。
+当前仍是开发版本。尚未完成参数绑定、通用结果行、预编译语句缓存、读连接池、写入调度器、平台密钥库适配和断电故障注入。下一切片优先完成 Statement/Value/Row API 与 C 绑定接口。
 
 ## M0：规格与工程骨架
 

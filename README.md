@@ -16,9 +16,34 @@ CSGDB（Context-State-Graph Database）是一套面向终端智能体的本地�
 
 ## 当前状态
 
-CSGDB 处于 M0 工程骨架阶段。仓库已经包含 Rust Workspace、安全打开策略、密钥来源抽象、公共 Rust API 骨架、版本化 C ABI 基础、CLI 与 CI；事务存储和实际落盘加密后端将从 M1 开始接入。
+CSGDB 已进入 M1。当前代码已经能够创建和重开真实加密 `.db`，执行 SQL，提交或回滚事务，并通过 Rust API 与 C ABI 使用；显式明文模式生成普通兼容数据库。下一切片将继续实现参数绑定、结果行、预编译语句缓存和连接管理。
 
 尚未发布可用于生产环境的版本，也不应将当前设计文档视为已经实现的安全保证。
+
+## 快速开始
+
+当前最直接的加密打开方式是显式提供口令：
+
+```rust
+use csgdb::Database;
+
+let mut db = Database::open_with_passphrase("agent.db", "replace-with-a-secret")?;
+
+db.execute_batch(
+    "CREATE TABLE IF NOT EXISTS memory (
+        id INTEGER PRIMARY KEY,
+        body TEXT NOT NULL
+    );"
+)?;
+
+let tx = db.transaction()?;
+tx.execute_batch("INSERT INTO memory(body) VALUES ('first memory');")?;
+tx.commit()?;
+
+# Ok::<(), csgdb::Error>(())
+```
+
+`Database::open("agent.db")` 仍然代表默认加密策略，但需要已经配置 KeyProvider；当前没有平台密钥库适配时会安全失败，不会创建明文数据库。
 
 ## 核心能力
 
@@ -134,4 +159,4 @@ CSGDB 对外统一使用普通 `.db` 扩展名，加密数据库与显式创建�
 
 ## License
 
-CSGDB 使用 [MIT License](LICENSE)。
+CSGDB 自有代码使用 [MIT License](LICENSE)。静态链接的第三方组件保留各自许可证，见 [第三方声明](THIRD_PARTY-NOTICES.md)。
