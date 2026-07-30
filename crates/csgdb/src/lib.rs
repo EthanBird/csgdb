@@ -6,17 +6,18 @@
 pub use csgdb_core::{
     prepare_open, DatabaseIdentity, Error, ErrorCode, KeyProvider, KeySource, OpenFlags,
     OpenOptions, OpenPlan, ResolvedKeyRef, ResolvedOpenPlan, Result, SecretKey, SecretString,
-    SecurityMode, Value, ValueRef, ValueType, ABI_VERSION, LIB_VERSION, LIB_VERSION_NUMBER,
-    RAW_KEY_LENGTH, SOURCE_ID,
+    SecurityMode, TransactionState, Value, ValueRef, ValueType, ABI_VERSION, LIB_VERSION,
+    LIB_VERSION_NUMBER, RAW_KEY_LENGTH, SOURCE_ID,
 };
 pub use csgdb_storage::{
-    Row, Rows, Statement, Transaction, DEFAULT_PREPARED_STATEMENT_CACHE_CAPACITY,
+    InterruptHandle, Row, Rows, Statement, Transaction, DEFAULT_PREPARED_STATEMENT_CACHE_CAPACITY,
 };
 
 use std::ffi::c_void;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// Builder for a database connection.
 pub struct DatabaseBuilder {
@@ -205,6 +206,88 @@ impl Database {
         self.connection.flush_prepared_statement_cache();
     }
 
+    /// Returns the number of rows changed by the most recently completed
+    /// INSERT, UPDATE, or DELETE statement.
+    #[must_use]
+    pub fn changes(&self) -> u64 {
+        self.connection.changes()
+    }
+
+    /// Returns the cumulative number of changed rows since this connection
+    /// was opened.
+    #[must_use]
+    pub fn total_changes(&self) -> u64 {
+        self.connection.total_changes()
+    }
+
+    /// Returns the rowid produced by the most recent successful INSERT.
+    #[must_use]
+    pub fn last_insert_rowid(&self) -> i64 {
+        self.connection.last_insert_rowid()
+    }
+
+    /// Returns whether the connection is currently in autocommit mode.
+    #[must_use]
+    pub fn is_autocommit(&self) -> bool {
+        self.connection.is_autocommit()
+    }
+
+    /// Returns whether any statement on the connection is actively running.
+    #[must_use]
+    pub fn is_busy(&self) -> bool {
+        self.connection.is_busy()
+    }
+
+    /// Returns whether an interrupt is currently pending or being processed.
+    #[must_use]
+    pub fn is_interrupted(&self) -> bool {
+        self.connection.is_interrupted()
+    }
+
+    /// Returns whether a named attached database is read-only.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `database_name` is not attached.
+    pub fn is_readonly(&self, database_name: &str) -> Result<bool> {
+        self.connection.is_readonly(database_name)
+    }
+
+    /// Returns current transaction activity for one database, or the highest
+    /// activity across all attached databases when the name is absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when transaction state cannot be inspected.
+    pub fn transaction_state(&self, database_name: Option<&str>) -> Result<TransactionState> {
+        self.connection.transaction_state(database_name)
+    }
+
+    /// Replaces the busy timeout for this connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the timeout is outside the engine's range.
+    pub fn set_busy_timeout(&self, timeout: Duration) -> Result<()> {
+        self.connection.set_busy_timeout(timeout)
+    }
+
+    /// Returns a thread-safe handle that can interrupt a running operation
+    /// without borrowing the database.
+    #[must_use]
+    pub fn interrupt_handle(&self) -> InterruptHandle {
+        self.connection.interrupt_handle()
+    }
+
+    /// Asks the engine to release connection-local heap caches.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the engine cannot release its caches.
+    pub fn release_memory(&self) -> Result<()> {
+        self.connection.release_memory()
+    }
+
     /// Reads a single integer value.
     ///
     /// # Errors
@@ -253,7 +336,7 @@ mod tests {
     use super::*;
     use std::fs;
     use std::io::Read;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
     static NEXT_DATABASE: AtomicU64 = AtomicU64::new(1);
 
@@ -464,6 +547,7 @@ mod tests {
             .expect("bind query");
         {
             let row = rows.next_row().expect("advance query").expect("one row");
+            assert!(database.is_busy());
             assert_eq!(row.column_count(), 5);
             assert_eq!(row.get_i64(0).expect("integer"), 42);
             assert!((row.get_f64(1).expect("real") - 3.25).abs() < f64::EPSILON);
@@ -473,6 +557,7 @@ mod tests {
             assert_eq!(row.value_type(4).expect("null type"), ValueType::Null);
         }
         assert!(rows.next_row().expect("finish query").is_none());
+        assert!(!database.is_busy());
     }
 
     #[test]
@@ -545,5 +630,141 @@ mod tests {
                 .expect("count"),
             1
         );
+    }
+
+    #[test]
+    fn connection_observability_tracks_writes_and_transaction_state() {
+        let path = TestDatabasePath::new("connection-state");
+        let mut database =
+            Database::open_with_key(path.path(), test_key(31)).expect("open encrypted database");
+        database
+            .execute_batch("CREATE TABLE event(id INTEGER PRIMARY KEY, body TEXT NOT NULL);")
+            .expect("create table");
+
+        assert!(database.is_autocommit());
+        assert!(!database.is_busy());
+        assert!(!database.is_interrupted());
+        assert!(!database.is_readonly("main").expect("main database mode"));
+        assert_eq!(
+            database.transaction_state(None).expect("transaction state"),
+            TransactionState::None
+        );
+
+        assert_eq!(
+            database
+                .execute(
+                    "INSERT INTO event(body) VALUES (?)",
+                    &[ValueRef::Text("first")],
+                )
+                .expect("insert"),
+            1
+        );
+        assert_eq!(database.changes(), 1);
+        assert_eq!(database.total_changes(), 1);
+        assert_eq!(database.last_insert_rowid(), 1);
+
+        {
+            let transaction = database.transaction().expect("begin transaction");
+            assert_eq!(
+                transaction
+                    .transaction_state(None)
+                    .expect("initial transaction state"),
+                TransactionState::None
+            );
+            assert_eq!(
+                transaction
+                    .query_i64("SELECT count(*) FROM event")
+                    .expect("read in transaction"),
+                1
+            );
+            assert_eq!(
+                transaction
+                    .transaction_state(None)
+                    .expect("read transaction state"),
+                TransactionState::Read
+            );
+            transaction
+                .execute(
+                    "INSERT INTO event(body) VALUES (?)",
+                    &[ValueRef::Text("second")],
+                )
+                .expect("write in transaction");
+            assert_eq!(
+                transaction
+                    .transaction_state(None)
+                    .expect("write transaction state"),
+                TransactionState::Write
+            );
+            transaction.commit().expect("commit");
+        }
+
+        assert!(database.is_autocommit());
+        assert_eq!(database.total_changes(), 2);
+        assert_eq!(
+            database.transaction_state(None).expect("transaction state"),
+            TransactionState::None
+        );
+        database
+            .set_busy_timeout(Duration::from_millis(25))
+            .expect("set busy timeout");
+        database.release_memory().expect("release caches");
+
+        let error = database
+            .set_busy_timeout(Duration::from_millis(2_147_483_648))
+            .expect_err("oversized timeout must fail without panicking");
+        assert_eq!(error.code(), ErrorCode::InvalidBusyTimeout);
+
+        database.close().expect("close writable database");
+        let readonly = Database::builder(path.path())
+            .key(test_key(31))
+            .flags(OpenFlags::READONLY | OpenFlags::ENCRYPTED | OpenFlags::FULLMUTEX)
+            .open()
+            .expect("open read-only database");
+        assert!(readonly.is_readonly("main").expect("read-only state"));
+    }
+
+    #[test]
+    fn interrupt_handle_cancels_a_long_query_and_survives_close() {
+        let path = TestDatabasePath::new("interrupt");
+        let database =
+            Database::open_with_key(path.path(), test_key(32)).expect("open encrypted database");
+        let interrupt = database.interrupt_handle();
+        let post_close_interrupt = database.interrupt_handle();
+        let started = Arc::new(AtomicBool::new(false));
+        let worker_started = Arc::clone(&started);
+
+        let worker = std::thread::spawn(move || {
+            worker_started.store(true, Ordering::Release);
+            let result = database.query_i64(
+                "WITH RECURSIVE counter(value) AS (
+                    VALUES(0)
+                    UNION ALL
+                    SELECT value + 1 FROM counter WHERE value < 50000000
+                 )
+                 SELECT sum(value) FROM counter",
+            );
+            (database, result)
+        });
+
+        while !started.load(Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        let interrupter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(25));
+            interrupt.interrupt();
+        });
+
+        let (database, result) = worker.join().expect("query worker");
+        interrupter.join().expect("interrupt worker");
+        let error = result.expect_err("long query must be interrupted");
+        assert_eq!(error.code(), ErrorCode::QueryInterrupted);
+        assert_eq!(
+            database.query_i64("SELECT 1").expect("connection recovers"),
+            1
+        );
+        database.close().expect("close database");
+
+        // The detached handle is deliberately safe after connection close.
+        post_close_interrupt.interrupt();
     }
 }

@@ -14,6 +14,7 @@ csgdb-core = { path = "../csgdb-core" }
 rusqlite = { version = "0.39.0", default-features = false, features = [
     "bundled-sqlcipher-vendored-openssl",
     "cache",
+    "modern_sqlite",
 ] }
 
 [lints]

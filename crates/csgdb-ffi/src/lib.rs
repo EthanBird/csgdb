@@ -1,6 +1,7 @@
 use csgdb_api::Result as CsgResult;
 use csgdb_api::{
-    Database, Error, ErrorCode, KeySource, OpenFlags, OpenOptions, SecretKey, SecretString,
+    Database, Error, ErrorCode, InterruptHandle, KeySource, OpenFlags, OpenOptions, SecretKey,
+    SecretString, TransactionState,
 };
 use csgdb_core::{
     ABI_VERSION, DEFAULT_BUSY_TIMEOUT_MS, DEFAULT_CACHE_SIZE_BYTES, DEFAULT_MEMORY_BUDGET_BYTES,
@@ -30,6 +31,7 @@ static MESSAGE_CORRUPT: &[u8] = b"database is corrupt or authentication failed\0
 static MESSAGE_STORAGE: &[u8] = b"database operation failed\0";
 static MESSAGE_MISUSE: &[u8] = b"statement is not in a valid state for this operation\0";
 static MESSAGE_RANGE: &[u8] = b"parameter or column index is out of range\0";
+static MESSAGE_INTERRUPT: &[u8] = b"database operation interrupted\0";
 
 pub const CSGDB_OK: i32 = 0;
 pub const CSGDB_INVALID_ARGUMENT: i32 = 1;
@@ -44,6 +46,11 @@ pub const CSGDB_CORRUPT: i32 = 9;
 pub const CSGDB_STORAGE: i32 = 10;
 pub const CSGDB_MISUSE: i32 = 11;
 pub const CSGDB_RANGE: i32 = 12;
+pub const CSGDB_INTERRUPT: i32 = 13;
+
+pub const CSGDB_TXN_NONE: i32 = 0;
+pub const CSGDB_TXN_READ: i32 = 1;
+pub const CSGDB_TXN_WRITE: i32 = 2;
 
 pub const CSGDB_INTEGER: i32 = 1;
 pub const CSGDB_FLOAT: i32 = 2;
@@ -113,13 +120,16 @@ impl Default for csgdb_open_options {
 
 struct SharedDatabase {
     database: Mutex<Database>,
+    interrupt: InterruptHandle,
     last_code: AtomicI32,
 }
 
 impl SharedDatabase {
     fn new(database: Database) -> Self {
+        let interrupt = database.interrupt_handle();
         Self {
             database: Mutex::new(database),
+            interrupt,
             last_code: AtomicI32::new(CSGDB_OK),
         }
     }
@@ -414,6 +424,242 @@ pub unsafe extern "C" fn csgdb_exec(database: *mut CsgdbHandle, sql: *const c_ch
         return CSGDB_STORAGE;
     };
     match connection.execute_batch(sql) {
+        Ok(()) => {
+            shared.set_ok();
+            CSGDB_OK
+        }
+        Err(error) => shared.set_error(&error),
+    }
+}
+
+/// Returns the number of rows changed by the most recently completed write.
+///
+/// # Safety
+///
+/// `database` must be null or a live database handle.
+#[no_mangle]
+pub unsafe extern "C" fn csgdb_changes64(database: *const CsgdbHandle) -> i64 {
+    // SAFETY: the caller guarantees a null or live handle.
+    let Some(database) = (unsafe { database.as_ref() }) else {
+        return 0;
+    };
+    with_database_value(database, 0, |connection| {
+        i64::try_from(connection.changes()).unwrap_or(i64::MAX)
+    })
+}
+
+/// Returns the cumulative number of changed rows for this connection.
+///
+/// # Safety
+///
+/// `database` must be null or a live database handle.
+#[no_mangle]
+pub unsafe extern "C" fn csgdb_total_changes64(database: *const CsgdbHandle) -> i64 {
+    // SAFETY: the caller guarantees a null or live handle.
+    let Some(database) = (unsafe { database.as_ref() }) else {
+        return 0;
+    };
+    with_database_value(database, 0, |connection| {
+        i64::try_from(connection.total_changes()).unwrap_or(i64::MAX)
+    })
+}
+
+/// Returns the rowid from the most recent successful INSERT.
+///
+/// # Safety
+///
+/// `database` must be null or a live database handle.
+#[no_mangle]
+pub unsafe extern "C" fn csgdb_last_insert_rowid(database: *const CsgdbHandle) -> i64 {
+    // SAFETY: the caller guarantees a null or live handle.
+    let Some(database) = (unsafe { database.as_ref() }) else {
+        return 0;
+    };
+    with_database_value(database, 0, Database::last_insert_rowid)
+}
+
+/// Returns nonzero when the connection is in autocommit mode.
+///
+/// # Safety
+///
+/// `database` must be null or a live database handle.
+#[no_mangle]
+pub unsafe extern "C" fn csgdb_get_autocommit(database: *const CsgdbHandle) -> c_int {
+    // SAFETY: the caller guarantees a null or live handle.
+    let Some(database) = (unsafe { database.as_ref() }) else {
+        return 0;
+    };
+    with_database_value(database, 0, |connection| {
+        c_int::from(connection.is_autocommit())
+    })
+}
+
+/// Returns 1 when a named database is read-only, 0 when writable, and -1
+/// when the name is invalid or inspection fails.
+///
+/// # Safety
+///
+/// `database` must be live and `database_name` must be a NUL-terminated UTF-8
+/// string.
+#[no_mangle]
+pub unsafe extern "C" fn csgdb_db_readonly(
+    database: *const CsgdbHandle,
+    database_name: *const c_char,
+) -> c_int {
+    // SAFETY: the caller guarantees a null or live handle.
+    let Some(database) = (unsafe { database.as_ref() }) else {
+        return -1;
+    };
+    let name = match c_string(database_name) {
+        Ok(name) => name,
+        Err(code) => {
+            if let Some(shared) = database.database.as_ref() {
+                shared.set_code(code);
+            }
+            return -1;
+        }
+    };
+    let Some(shared) = database.database.as_ref() else {
+        return -1;
+    };
+    let Ok(connection) = shared.database.lock() else {
+        shared.set_code(CSGDB_STORAGE);
+        return -1;
+    };
+    match connection.is_readonly(name) {
+        Ok(readonly) => {
+            shared.set_ok();
+            c_int::from(readonly)
+        }
+        Err(error) => {
+            shared.set_error(&error);
+            -1
+        }
+    }
+}
+
+/// Returns transaction activity for one database, or the highest activity
+/// across all attached databases when `database_name` is null.
+///
+/// # Safety
+///
+/// `database` must be live. A non-null `database_name` must be a
+/// NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn csgdb_txn_state(
+    database: *const CsgdbHandle,
+    database_name: *const c_char,
+) -> c_int {
+    // SAFETY: the caller guarantees a null or live handle.
+    let Some(database) = (unsafe { database.as_ref() }) else {
+        return -1;
+    };
+    let name = if database_name.is_null() {
+        None
+    } else {
+        match c_string(database_name) {
+            Ok(name) => Some(name),
+            Err(code) => {
+                if let Some(shared) = database.database.as_ref() {
+                    shared.set_code(code);
+                }
+                return -1;
+            }
+        }
+    };
+    let Some(shared) = database.database.as_ref() else {
+        return -1;
+    };
+    let Ok(connection) = shared.database.lock() else {
+        shared.set_code(CSGDB_STORAGE);
+        return -1;
+    };
+    match connection.transaction_state(name) {
+        Ok(state) => {
+            shared.set_ok();
+            match state {
+                TransactionState::None => CSGDB_TXN_NONE,
+                TransactionState::Read => CSGDB_TXN_READ,
+                TransactionState::Write => CSGDB_TXN_WRITE,
+            }
+        }
+        Err(error) => {
+            shared.set_error(&error);
+            -1
+        }
+    }
+}
+
+/// Replaces the busy timeout in milliseconds.
+///
+/// # Safety
+///
+/// `database` must be a live database handle.
+#[no_mangle]
+pub unsafe extern "C" fn csgdb_busy_timeout(database: *mut CsgdbHandle, timeout_ms: c_int) -> i32 {
+    // SAFETY: the caller guarantees a null or live handle.
+    let Some(database) = (unsafe { database.as_ref() }) else {
+        return CSGDB_INVALID_ARGUMENT;
+    };
+    if timeout_ms < 0 {
+        if let Some(shared) = database.database.as_ref() {
+            return shared.set_code(CSGDB_INVALID_ARGUMENT);
+        }
+        return CSGDB_INVALID_ARGUMENT;
+    }
+    let Some(shared) = database.database.as_ref() else {
+        return database.current_code();
+    };
+    let Ok(connection) = shared.database.lock() else {
+        return shared.set_code(CSGDB_STORAGE);
+    };
+    match connection.set_busy_timeout(Duration::from_millis(
+        u64::try_from(timeout_ms).unwrap_or_default(),
+    )) {
+        Ok(()) => {
+            shared.set_ok();
+            CSGDB_OK
+        }
+        Err(error) => shared.set_error(&error),
+    }
+}
+
+/// Interrupts the operation currently running on this connection.
+///
+/// Unlike ordinary connection functions, this call does not wait for the
+/// connection mutex held by the operation being cancelled.
+///
+/// # Safety
+///
+/// `database` must be null or a live database handle.
+#[no_mangle]
+pub unsafe extern "C" fn csgdb_interrupt(database: *mut CsgdbHandle) {
+    // SAFETY: the caller guarantees a null or live handle.
+    if let Some(shared) =
+        (unsafe { database.as_ref() }).and_then(|database| database.database.as_ref())
+    {
+        shared.interrupt.interrupt();
+    }
+}
+
+/// Asks the engine to release connection-local heap caches.
+///
+/// # Safety
+///
+/// `database` must be a live database handle.
+#[no_mangle]
+pub unsafe extern "C" fn csgdb_release_memory(database: *mut CsgdbHandle) -> i32 {
+    // SAFETY: the caller guarantees a null or live handle.
+    let Some(database) = (unsafe { database.as_ref() }) else {
+        return CSGDB_INVALID_ARGUMENT;
+    };
+    let Some(shared) = database.database.as_ref() else {
+        return database.current_code();
+    };
+    let Ok(connection) = shared.database.lock() else {
+        return shared.set_code(CSGDB_STORAGE);
+    };
+    match connection.release_memory() {
         Ok(()) => {
             shared.set_ok();
             CSGDB_OK
@@ -1129,6 +1375,23 @@ fn bind_value(
     statement_ready_operation(statement, operation)
 }
 
+fn with_database_value<T>(
+    database: &CsgdbHandle,
+    default: T,
+    operation: impl FnOnce(&Database) -> T,
+) -> T {
+    let Some(shared) = database.database.as_ref() else {
+        return default;
+    };
+    let Ok(connection) = shared.database.lock() else {
+        shared.set_code(CSGDB_STORAGE);
+        return default;
+    };
+    let value = operation(&connection);
+    shared.set_ok();
+    value
+}
+
 fn statement_ready_operation(
     statement: &CsgdbStatement,
     operation: impl FnOnce(*mut sqlite::sqlite3_stmt) -> c_int,
@@ -1243,6 +1506,7 @@ fn map_sqlite_code(result: c_int) -> i32 {
         sqlite::SQLITE_CORRUPT | sqlite::SQLITE_NOTADB => CSGDB_CORRUPT,
         sqlite::SQLITE_MISUSE => CSGDB_MISUSE,
         sqlite::SQLITE_RANGE => CSGDB_RANGE,
+        sqlite::SQLITE_INTERRUPT => CSGDB_INTERRUPT,
         _ => CSGDB_STORAGE,
     }
 }
@@ -1348,13 +1612,15 @@ fn error_code(error: &Error) -> i32 {
         ErrorCode::DatabaseReadOnly => CSGDB_READONLY,
         ErrorCode::ConstraintViolation => CSGDB_CONSTRAINT,
         ErrorCode::DatabaseCorrupt => CSGDB_CORRUPT,
+        ErrorCode::QueryInterrupted => CSGDB_INTERRUPT,
         ErrorCode::InvalidParameterIndex | ErrorCode::InvalidColumnIndex => CSGDB_RANGE,
         ErrorCode::InvalidStatementState => CSGDB_MISUSE,
         ErrorCode::InvalidPath
         | ErrorCode::InvalidSql
         | ErrorCode::ParameterCountMismatch
         | ErrorCode::InvalidColumnType
-        | ErrorCode::InvalidUtf8 => CSGDB_INVALID_ARGUMENT,
+        | ErrorCode::InvalidUtf8
+        | ErrorCode::InvalidBusyTimeout => CSGDB_INVALID_ARGUMENT,
         _ => CSGDB_STORAGE,
     }
 }
@@ -1373,6 +1639,7 @@ fn error_message(code: i32) -> &'static [u8] {
         CSGDB_CORRUPT => MESSAGE_CORRUPT,
         CSGDB_MISUSE => MESSAGE_MISUSE,
         CSGDB_RANGE => MESSAGE_RANGE,
+        CSGDB_INTERRUPT => MESSAGE_INTERRUPT,
         _ => MESSAGE_STORAGE,
     }
 }
@@ -1561,6 +1828,35 @@ mod tests {
         assert_eq!(unsafe { csgdb_reset(statement) }, CSGDB_OK);
         assert_eq!(unsafe { csgdb_clear_bindings(statement) }, CSGDB_OK);
         assert_eq!(unsafe { csgdb_finalize(statement) }, CSGDB_OK);
+        assert_eq!(unsafe { csgdb_changes64(database) }, 1);
+        assert_eq!(unsafe { csgdb_total_changes64(database) }, 1);
+        assert_eq!(unsafe { csgdb_last_insert_rowid(database) }, 41);
+        assert_eq!(unsafe { csgdb_get_autocommit(database) }, 1);
+        assert_eq!(unsafe { csgdb_db_readonly(database, c"main".as_ptr()) }, 0);
+        assert_eq!(
+            unsafe { csgdb_txn_state(database, ptr::null()) },
+            CSGDB_TXN_NONE
+        );
+        assert_eq!(
+            unsafe { csgdb_busy_timeout(database, -1) },
+            CSGDB_INVALID_ARGUMENT
+        );
+        assert_eq!(unsafe { csgdb_busy_timeout(database, 25) }, CSGDB_OK);
+
+        let begin = CString::new("BEGIN IMMEDIATE").expect("begin");
+        assert_eq!(unsafe { csgdb_exec(database, begin.as_ptr()) }, CSGDB_OK);
+        assert_eq!(unsafe { csgdb_get_autocommit(database) }, 0);
+        assert_eq!(
+            unsafe { csgdb_txn_state(database, ptr::null()) },
+            CSGDB_TXN_WRITE
+        );
+        let rollback = CString::new("ROLLBACK").expect("rollback");
+        assert_eq!(unsafe { csgdb_exec(database, rollback.as_ptr()) }, CSGDB_OK);
+        assert_eq!(unsafe { csgdb_get_autocommit(database) }, 1);
+        assert_eq!(
+            unsafe { csgdb_txn_state(database, ptr::null()) },
+            CSGDB_TXN_NONE
+        );
 
         let select =
             CString::new("SELECT id, score, body, payload, optional FROM sample WHERE id = ?")
@@ -1607,6 +1903,63 @@ mod tests {
         assert!(unsafe { csgdb_column_text(statement, 4) }.is_null());
         assert_eq!(unsafe { csgdb_step(statement) }, CSGDB_DONE);
         assert_eq!(unsafe { csgdb_finalize(statement) }, CSGDB_OK);
+        assert_eq!(unsafe { csgdb_release_memory(database) }, CSGDB_OK);
+        assert_eq!(unsafe { csgdb_close(database) }, CSGDB_OK);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn interrupt_c_api_cancels_a_running_statement() {
+        let (path, c_path) = test_path("interrupt");
+        let key = [19_u8; 32];
+        let mut database = ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                csgdb_open_with_key(
+                    c_path.as_ptr(),
+                    key.as_ptr().cast(),
+                    key.len(),
+                    &raw mut database,
+                )
+            },
+            CSGDB_OK
+        );
+
+        let query = CString::new(
+            "WITH RECURSIVE counter(value) AS (
+                VALUES(0)
+                UNION ALL
+                SELECT value + 1 FROM counter WHERE value < 50000000
+            )
+            SELECT sum(value) FROM counter",
+        )
+        .expect("query");
+        let mut statement = ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                csgdb_prepare_v2(
+                    database,
+                    query.as_ptr(),
+                    -1,
+                    &raw mut statement,
+                    ptr::null_mut(),
+                )
+            },
+            CSGDB_OK
+        );
+
+        let database_address = database as usize;
+        let interrupter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(25));
+            unsafe { csgdb_interrupt(database_address as *mut CsgdbHandle) };
+        });
+        assert_eq!(unsafe { csgdb_step(statement) }, CSGDB_INTERRUPT);
+        interrupter.join().expect("interrupter thread");
+        assert_eq!(unsafe { csgdb_errcode(database) }, CSGDB_INTERRUPT);
+        assert_eq!(unsafe { csgdb_finalize(statement) }, CSGDB_INTERRUPT);
+
+        let probe = CString::new("SELECT 1").expect("probe");
+        assert_eq!(unsafe { csgdb_exec(database, probe.as_ptr()) }, CSGDB_OK);
         assert_eq!(unsafe { csgdb_close(database) }, CSGDB_OK);
         remove_database(&path);
     }

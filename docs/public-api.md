@@ -295,6 +295,10 @@ csgdb_step / reset / clear_bindings / finalize
 csgdb_column_count / name / type
 csgdb_column_int / int64 / double / text / blob / bytes
 
+csgdb_changes64 / total_changes64 / last_insert_rowid
+csgdb_get_autocommit / db_readonly / txn_state
+csgdb_busy_timeout / interrupt / release_memory
+
 csgdb_errcode / errmsg / errstr
 csgdb_close
 ```
@@ -302,10 +306,6 @@ csgdb_close
 后续兼容切片：
 
 ```text
-
-csgdb_changes / total_changes / last_insert_rowid
-csgdb_busy_timeout / interrupt
-
 csgdb_extended_errcode
 csgdb_close_v2
 ```
@@ -315,6 +315,18 @@ csgdb_close_v2
 `csgdb_bind_text` 和 `csgdb_bind_blob` 在返回前复制调用方数据。Column 返回的文本和 Blob 指针仅在当前 Row 有效；下一次 `step`、`reset` 或 `finalize` 会使其失效。Statement 到达 `DONE` 或错误状态后必须先 `reset` 才能再次执行。
 
 关闭数据库句柄时，如果还有 Statement 存活，连接关闭会延后到最后一个 Statement 完成 `finalize`。调用方仍必须对同一 Statement 的访问进行串行化。
+
+连接状态接口遵循以下约定：
+
+- `csgdb_changes64` 返回最近一次完成的写操作所影响的行数；
+- `csgdb_total_changes64` 返回当前连接的累计变更行数；
+- `csgdb_txn_state(db, NULL)` 返回所有已附加数据库中的最高事务活动，状态为 `CSGDB_TXN_NONE`、`CSGDB_TXN_READ` 或 `CSGDB_TXN_WRITE`；
+- `csgdb_db_readonly` 返回 `1` 或 `0`，无效数据库名和检查失败返回 `-1`；
+- `csgdb_busy_timeout` 接受非负毫秒值，后一次调用替换前一次配置；
+- `csgdb_interrupt` 可以从另一个线程调用，不等待正在执行语句持有的连接锁；
+- `csgdb_release_memory` 主动释放连接本地的可回收缓存。
+
+`csgdb_interrupt` 与其他连接操作并发调用是安全的，但调用方必须保证数据库句柄在中断调用返回前仍然存活；不得令 `close` 与 `interrupt` 竞争。被取消的 `step` 返回 `CSGDB_INTERRUPT`。连接本身仍可继续使用，Statement 应先 `finalize`，或按其状态执行 `reset` 后再复用。
 
 ## 8. Rust API
 
@@ -406,6 +418,43 @@ Row<'stmt>: borrowed
 Rows::next_row: 推进后使上一个 Row 借用失效
 ```
 
+连接观测与控制：
+
+```rust
+use std::time::Duration;
+use csgdb::TransactionState;
+
+db.set_busy_timeout(Duration::from_millis(250))?;
+
+assert!(db.is_autocommit());
+assert_eq!(db.transaction_state(None)?, TransactionState::None);
+
+let changed = db.changes();
+let changed_since_open = db.total_changes();
+let last_rowid = db.last_insert_rowid();
+
+db.release_memory()?;
+```
+
+`is_readonly("main")` 检查指定数据库的打开模式，`is_busy()` 表示当前连接是否存在尚未完成的 Statement，`is_interrupted()` 表示连接中断当前是否仍在生效。`transaction_state(None)` 汇总所有已附加数据库，传入 `Some("main")` 则只检查主库。
+
+长查询取消通过与数据库借用分离的 `InterruptHandle` 完成：
+
+```rust
+let interrupt = db.interrupt_handle();
+
+// 将 db 移交给数据库工作线程执行查询。
+let worker = std::thread::spawn(move || {
+    db.query_i64(long_running_sql)
+});
+
+// 可从控制线程或请求超时处理器调用。
+interrupt.interrupt();
+let result = worker.join().expect("database worker");
+```
+
+中断句柄可以跨线程移动；数据库关闭后再调用会安全地成为空操作。取消只终止当前运行，连接在清理当前 Statement 后仍可继续使用。
+
 异步接口通过专用数据库工作线程实现，不要求底层文件 I/O 伪装成异步操作。
 
 ## 9. Agent 扩展
@@ -478,6 +527,7 @@ CORRUPT                    9
 STORAGE                   10
 MISUSE                    11
 RANGE                     12
+INTERRUPT                 13
 ROW                      100
 DONE                     101
 ```
@@ -493,7 +543,7 @@ INDEX_REBUILD_REQUIRED
 MIGRATION_INCOMPLETE
 ```
 
-`MISUSE` 表示语句状态不允许当前操作，`RANGE` 表示参数或结果列索引越界。C ABI 的错误数字一经稳定发布，不再重排。
+`MISUSE` 表示语句状态不允许当前操作，`RANGE` 表示参数或结果列索引越界，`INTERRUPT` 表示运行中的数据库操作被显式取消。C ABI 的错误数字一经稳定发布，不再重排。
 
 ## 12. 版本与兼容承诺
 

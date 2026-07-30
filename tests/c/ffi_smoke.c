@@ -61,6 +61,18 @@ int main(int argc, char **argv) {
     if (rc != CSGDB_OK) {
         return fail(db, "finalize insert", rc);
     }
+    if (csgdb_changes64(db) != 1 ||
+        csgdb_total_changes64(db) < 1 ||
+        csgdb_last_insert_rowid(db) != 7 ||
+        csgdb_get_autocommit(db) == 0 ||
+        csgdb_db_readonly(db, "main") != 0 ||
+        csgdb_txn_state(db, NULL) != CSGDB_TXN_NONE) {
+        return fail(db, "connection state", csgdb_errcode(db));
+    }
+    rc = csgdb_busy_timeout(db, 20);
+    if (rc != CSGDB_OK) {
+        return fail(db, "busy timeout", rc);
+    }
 
     const char *select_sql =
         "SELECT id, value, payload FROM smoke WHERE id = ?";
@@ -94,6 +106,10 @@ int main(int argc, char **argv) {
     rc = csgdb_finalize(statement);
     if (rc != CSGDB_OK) {
         return fail(db, "finalize select", rc);
+    }
+    rc = csgdb_release_memory(db);
+    if (rc != CSGDB_OK) {
+        return fail(db, "release memory", rc);
     }
 
     rc = csgdb_close(db);

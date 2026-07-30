@@ -2,15 +2,17 @@
 
 use csgdb_core::{
     Error, ErrorCode, OpenFlags as CoreOpenFlags, ResolvedKeyRef, ResolvedOpenPlan, Result,
-    SecurityMode, Value, ValueRef, ValueType,
+    SecurityMode, TransactionState, Value, ValueRef, ValueType,
 };
 use rusqlite::{
     ffi, types::ValueRef as SqlValueRef, CachedStatement, Connection as SqlConnection,
     OpenFlags as SqlOpenFlags,
 };
 use std::ffi::{c_int, c_void};
+use std::time::Duration;
 
 const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
+const MAX_BUSY_TIMEOUT_MILLIS: u128 = 2_147_483_647;
 pub const DEFAULT_PREPARED_STATEMENT_CACHE_CAPACITY: usize = 16;
 
 /// A live storage-kernel connection.
@@ -110,6 +112,102 @@ impl Connection {
     /// Finalizes every idle statement currently held by the connection cache.
     pub fn flush_prepared_statement_cache(&self) {
         self.inner.flush_prepared_statement_cache();
+    }
+
+    /// Returns the number of rows changed by the most recently completed
+    /// INSERT, UPDATE, or DELETE statement.
+    #[must_use]
+    pub fn changes(&self) -> u64 {
+        self.inner.changes()
+    }
+
+    /// Returns the cumulative number of changed rows since this connection
+    /// was opened.
+    #[must_use]
+    pub fn total_changes(&self) -> u64 {
+        self.inner.total_changes()
+    }
+
+    /// Returns the rowid produced by the most recent successful INSERT on
+    /// this connection.
+    #[must_use]
+    pub fn last_insert_rowid(&self) -> i64 {
+        self.inner.last_insert_rowid()
+    }
+
+    /// Returns whether the connection is currently in autocommit mode.
+    #[must_use]
+    pub fn is_autocommit(&self) -> bool {
+        self.inner.is_autocommit()
+    }
+
+    /// Returns whether any statement on the connection is actively running.
+    #[must_use]
+    pub fn is_busy(&self) -> bool {
+        self.inner.is_busy()
+    }
+
+    /// Returns whether an interrupt is currently pending or being processed.
+    #[must_use]
+    pub fn is_interrupted(&self) -> bool {
+        self.inner.is_interrupted()
+    }
+
+    /// Returns whether a named attached database is read-only.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `database_name` is not attached.
+    pub fn is_readonly(&self, database_name: &str) -> Result<bool> {
+        self.inner
+            .is_readonly(database_name)
+            .map_err(|error| map_storage_error(&error))
+    }
+
+    /// Returns the current transaction activity for one database, or the
+    /// highest activity across all attached databases when the name is absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the engine cannot inspect transaction state.
+    pub fn transaction_state(&self, database_name: Option<&str>) -> Result<TransactionState> {
+        let state = self
+            .inner
+            .transaction_state(database_name)
+            .map_err(|error| map_storage_error(&error))?;
+        map_transaction_state(state)
+    }
+
+    /// Replaces the connection's busy timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error rather than panicking when the timeout exceeds the
+    /// storage engine's signed 32-bit millisecond range.
+    pub fn set_busy_timeout(&self, timeout: Duration) -> Result<()> {
+        validate_busy_timeout(timeout)?;
+        self.inner
+            .busy_timeout(timeout)
+            .map_err(|error| map_storage_error(&error))
+    }
+
+    /// Creates a thread-safe handle for interrupting a long-running operation.
+    #[must_use]
+    pub fn interrupt_handle(&self) -> InterruptHandle {
+        InterruptHandle {
+            inner: self.inner.get_interrupt_handle(),
+        }
+    }
+
+    /// Asks the storage engine to release connection-local heap caches.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the engine cannot release its caches.
+    pub fn release_memory(&self) -> Result<()> {
+        self.inner
+            .release_memory()
+            .map_err(|error| map_storage_error(&error))
     }
 
     /// Returns the underlying SQL connection pointer for the C ABI layer.
@@ -215,6 +313,20 @@ impl Transaction<'_> {
         Ok(Statement::direct(inner))
     }
 
+    /// Returns the transaction activity for one database, or the highest
+    /// activity across all attached databases when the name is absent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the engine cannot inspect transaction state.
+    pub fn transaction_state(&self, database_name: Option<&str>) -> Result<TransactionState> {
+        let state = self
+            .inner
+            .transaction_state(database_name)
+            .map_err(|error| map_storage_error(&error))?;
+        map_transaction_state(state)
+    }
+
     /// Commits all transaction changes.
     ///
     /// # Errors
@@ -235,6 +347,21 @@ impl Transaction<'_> {
         self.inner
             .rollback()
             .map_err(|error| map_storage_error(&error))
+    }
+}
+
+/// A thread-safe cancellation handle detached from a database borrow.
+///
+/// Calling [`InterruptHandle::interrupt`] after the database has closed is a
+/// safe no-op.
+pub struct InterruptHandle {
+    inner: rusqlite::InterruptHandle,
+}
+
+impl InterruptHandle {
+    /// Interrupts the operation currently executing on the connection.
+    pub fn interrupt(&self) {
+        self.inner.interrupt();
     }
 }
 
@@ -511,6 +638,29 @@ fn invalid_column_type() -> Error {
     )
 }
 
+fn map_transaction_state(state: rusqlite::TransactionState) -> Result<TransactionState> {
+    match state {
+        rusqlite::TransactionState::None => Ok(TransactionState::None),
+        rusqlite::TransactionState::Read => Ok(TransactionState::Read),
+        rusqlite::TransactionState::Write => Ok(TransactionState::Write),
+        _ => Err(Error::new(
+            ErrorCode::Storage,
+            "database returned an unknown transaction state",
+        )),
+    }
+}
+
+fn validate_busy_timeout(timeout: Duration) -> Result<()> {
+    if timeout.as_millis() > MAX_BUSY_TIMEOUT_MILLIS {
+        Err(Error::new(
+            ErrorCode::InvalidBusyTimeout,
+            "busy timeout exceeds the supported millisecond range",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn sqlite_open_flags(flags: CoreOpenFlags) -> SqlOpenFlags {
     let mut mapped = if flags.contains(CoreOpenFlags::READONLY) {
         SqlOpenFlags::SQLITE_OPEN_READ_ONLY
@@ -655,6 +805,10 @@ fn map_storage_error(error: &rusqlite::Error) -> Error {
             rusqlite::ErrorCode::DatabaseCorrupt => {
                 Error::new(ErrorCode::DatabaseCorrupt, "database is corrupt")
             }
+            rusqlite::ErrorCode::OperationInterrupted => Error::new(
+                ErrorCode::QueryInterrupted,
+                "database operation was interrupted",
+            ),
             _ => Error::new(ErrorCode::Storage, "database operation failed"),
         },
         rusqlite::Error::SqlInputError { .. } => {

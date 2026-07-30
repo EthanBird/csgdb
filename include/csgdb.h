@@ -33,6 +33,11 @@ extern "C" {
 #define CSGDB_STORAGE 10
 #define CSGDB_MISUSE 11
 #define CSGDB_RANGE 12
+#define CSGDB_INTERRUPT 13
+
+#define CSGDB_TXN_NONE 0
+#define CSGDB_TXN_READ 1
+#define CSGDB_TXN_WRITE 2
 
 #define CSGDB_INTEGER 1
 #define CSGDB_FLOAT 2
@@ -110,6 +115,21 @@ CSGDB_API int32_t csgdb_open_v3(
     const csgdb_open_options *options
 );
 CSGDB_API int32_t csgdb_exec(csgdb *db, const char *sql);
+CSGDB_API int64_t csgdb_changes64(const csgdb *db);
+CSGDB_API int64_t csgdb_total_changes64(const csgdb *db);
+CSGDB_API int64_t csgdb_last_insert_rowid(const csgdb *db);
+CSGDB_API int32_t csgdb_get_autocommit(const csgdb *db);
+CSGDB_API int32_t csgdb_db_readonly(
+    const csgdb *db,
+    const char *database_name
+);
+CSGDB_API int32_t csgdb_txn_state(
+    const csgdb *db,
+    const char *database_name
+);
+CSGDB_API int32_t csgdb_busy_timeout(csgdb *db, int32_t timeout_ms);
+CSGDB_API void csgdb_interrupt(csgdb *db);
+CSGDB_API int32_t csgdb_release_memory(csgdb *db);
 CSGDB_API int32_t csgdb_prepare_v2(
     csgdb *db,
     const char *sql,

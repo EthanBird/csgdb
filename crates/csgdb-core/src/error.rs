@@ -15,6 +15,7 @@ pub enum ErrorCode {
     InvalidColumnType,
     InvalidUtf8,
     InvalidStatementState,
+    InvalidBusyTimeout,
     KeyRequired,
     KeyStoreUnavailable,
     PlaintextRequiresOptIn,
@@ -25,6 +26,7 @@ pub enum ErrorCode {
     ConstraintViolation,
     InvalidDatabaseKey,
     DatabaseCorrupt,
+    QueryInterrupted,
     Storage,
 }
 
