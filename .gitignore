@@ -6,9 +6,9 @@ Cargo.lock
 .vscode/
 *.swp
 *.swo
-*.csgdb-wal
-*.csgdb-shm
-*.csgdb-tmp
+*.db-wal
+*.db-shm
+*.db-tmp
 /bench-results/
 /coverage/
 /dist/

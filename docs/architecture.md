@@ -132,24 +132,25 @@ Reader N ──▶ Snapshot C
 
 ## 5. 文件组织
 
-默认采用数据库 Bundle：
+默认采用普通 `.db` 主文件。无论数据库是否加密，扩展名保持一致：
 
 ```text
-example.csgdb/
-├── MANIFEST
-├── data.db
-├── data.db-wal
-├── blobs/
-│   └── segment-*.pack
-├── indexes/
-│   └── generation-*/
-└── recovery/
-    └── checkpoint
+example.db
+example.db-wal
+example.db-shm
 ```
 
-`MANIFEST` 包含数据库 UUID、格式版本、当前索引代数、密钥标识和文件校验信息。Manifest 采用双槽或原子替换方式更新。
+数据库 UUID、格式版本、索引代数和密钥标识存放在受保护的内部元数据中。WAL 与共享状态文件属于运行时伴生文件，数据库正常关闭或完成 Checkpoint 后可以消失。
 
-便携单文件模式可以将 Artifact 保存为数据库 Blob，但不作为大规模 Agent 数据的默认配置。
+Artifact 默认可以作为 Blob 保存在主数据库中。数据规模较大时，可显式启用外部存储：
+
+```text
+example.db
+example.db.blobs/
+└── segment-*.pack
+```
+
+外部 Blob Pack 必须使用独立派生密钥加密，并通过主数据库中的事务元数据引用。外部存储是性能和容量选项，不改变主数据库的 `.db` 命名。
 
 ## 6. 后台任务
 

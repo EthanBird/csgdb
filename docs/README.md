@@ -7,10 +7,11 @@
 1. [系统架构](architecture.md)：分层、组件、事务与执行路径。
 2. [Agent 数据模型](data-model.md)：事件、状态、记忆、事实和来源。
 3. [CSG-Q 查询语言](query-language.md)：Rust DSL、AgentPlan、IR 和优化器。
-4. [存储、安全与恢复](storage-security.md)：存储内核、加密、迁移、备份和修复。
-5. [嵌入式与性能设计](embedded-performance.md)：设备档位、缓存、索引和基准。
-6. [测试与发布门槛](testing.md)：正确性、安全、兼容性和性能验证。
-7. [开发路线](development-plan.md)：里程碑、依赖和完成定义。
+4. [公共接口与兼容性](public-api.md)：Rust API、稳定 C ABI、打开流程和密钥规则。
+5. [存储、安全与恢复](storage-security.md)：存储内核、加密、迁移、备份和修复。
+6. [嵌入式与性能设计](embedded-performance.md)：设备档位、缓存、索引和基准。
+7. [测试与发布门槛](testing.md)：正确性、安全、兼容性和性能验证。
+8. [开发路线](development-plan.md)：里程碑、依赖和完成定义。
 
 ## 文档规范
 

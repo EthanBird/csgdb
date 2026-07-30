@@ -108,6 +108,7 @@ CSG-Q 不以复刻 SQL 语法为目标。它将结构化查询、混合召回、
 - [系统架构](docs/architecture.md)
 - [Agent 数据模型](docs/data-model.md)
 - [CSG-Q 查询语言](docs/query-language.md)
+- [公共接口与兼容性](docs/public-api.md)
 - [存储、安全与恢复](docs/storage-security.md)
 - [嵌入式与性能设计](docs/embedded-performance.md)
 - [测试与发布门槛](docs/testing.md)
@@ -124,6 +125,12 @@ CSG-Q 不以复刻 SQL 语法为目标。它将结构化查询、混合召回、
 5. 排名结果应包含可检查的得分构成与来源。
 6. 不在核心数据库中耦合具体模型服务或网络协议。
 7. 通过可重复基准测试决定优化，而不是凭经验固化参数。
+
+## 数据库文件
+
+CSGDB 对外统一使用普通 `.db` 扩展名，加密数据库与显式创建的明文数据库不通过文件名区分。`Database::open("agent.db")` 和 `csgdb_open("agent.db", &db)` 默认启用加密；明文只能通过明确的 API 或打开标志选择。
+
+扩展名不构成安全边界。数据库能否抵抗离线复制、篡改和密钥猜测，取决于真实加密格式、密钥来源、认证校验和安全失败策略。
 
 ## License
 
