@@ -1,7 +1,16 @@
 //! Public Rust API for CSGDB.
 //!
-//! The M1 foundation exposes secure database opening, SQL execution, and
-//! transactions over the bundled encrypted storage kernel.
+//! The M1 foundation exposes secure database opening, SQL execution,
+//! transactions, and optional bounded connection management over the bundled
+//! encrypted storage kernel.
+
+mod pool;
+
+pub use pool::{
+    DatabasePool, DatabasePoolBuilder, PoolOptions, PoolStats, ReadConnection, ReadTransaction,
+    WriteBackpressure, DEFAULT_READ_CONNECTIONS, DEFAULT_WRITE_QUEUE_CAPACITY,
+    MAX_READ_CONNECTIONS, MAX_WRITE_QUEUE_CAPACITY,
+};
 
 pub use csgdb_core::{
     prepare_open, DatabaseIdentity, Error, ErrorCode, KeyProvider, KeySource, OpenFlags,
@@ -83,8 +92,7 @@ impl DatabaseBuilder {
     /// connection initialization fails.
     pub fn open(self) -> Result<Database> {
         let plan = self.plan()?;
-        let connection = csgdb_storage::Connection::open(&plan)?;
-        Ok(Database { connection })
+        Database::open_resolved(&plan, false)
     }
 }
 
@@ -103,6 +111,15 @@ impl fmt::Debug for Database {
 }
 
 impl Database {
+    fn open_resolved(plan: &ResolvedOpenPlan, readonly: bool) -> Result<Self> {
+        let connection = if readonly {
+            csgdb_storage::Connection::open_readonly(plan)?
+        } else {
+            csgdb_storage::Connection::open(plan)?
+        };
+        Ok(Self { connection })
+    }
+
     #[must_use]
     pub fn builder(path: impl AsRef<Path>) -> DatabaseBuilder {
         DatabaseBuilder::new(path)

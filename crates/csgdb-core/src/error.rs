@@ -16,6 +16,7 @@ pub enum ErrorCode {
     InvalidUtf8,
     InvalidStatementState,
     InvalidBusyTimeout,
+    InvalidPoolConfiguration,
     KeyRequired,
     KeyStoreUnavailable,
     PlaintextRequiresOptIn,
@@ -27,6 +28,14 @@ pub enum ErrorCode {
     InvalidDatabaseKey,
     DatabaseCorrupt,
     QueryInterrupted,
+    ReadPoolExhausted,
+    WriteQueueFull,
+    WriteQueueTimeout,
+    ConnectionManagerClosed,
+    ConnectionManagerInUse,
+    WriteTaskPanicked,
+    ReentrantRead,
+    ReentrantWrite,
     Storage,
 }
 

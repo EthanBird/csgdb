@@ -29,7 +29,28 @@ impl Connection {
     /// Returns an error when the database cannot be opened, keying fails, the
     /// key is incorrect, or connection initialization cannot complete.
     pub fn open(plan: &ResolvedOpenPlan) -> Result<Self> {
-        let flags = sqlite_open_flags(plan.flags());
+        Self::open_with_access(plan, ConnectionAccess::ReadWrite)
+    }
+
+    /// Opens a validated plan as a read-only connection.
+    ///
+    /// The resolved key is reused only while opening the connection; no key
+    /// material is cloned.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the database cannot be opened read-only, keying
+    /// fails, the key is incorrect, or initialization cannot complete.
+    pub fn open_readonly(plan: &ResolvedOpenPlan) -> Result<Self> {
+        Self::open_with_access(plan, ConnectionAccess::ReadOnly)
+    }
+
+    fn open_with_access(plan: &ResolvedOpenPlan, access: ConnectionAccess) -> Result<Self> {
+        let flags = match access {
+            ConnectionAccess::ReadWrite => plan.flags(),
+            ConnectionAccess::ReadOnly => readonly_open_flags(plan.flags()),
+        };
+        let flags = sqlite_open_flags(flags);
         let inner = SqlConnection::open_with_flags(plan.path(), flags)
             .map_err(|error| map_open_error(&error))?;
 
@@ -41,7 +62,7 @@ impl Connection {
         inner
             .busy_timeout(plan.busy_timeout())
             .map_err(|error| map_storage_error(&error))?;
-        configure_connection(&inner, plan)?;
+        configure_connection(&inner, plan, access)?;
         inner.set_prepared_statement_cache_capacity(DEFAULT_PREPARED_STATEMENT_CACHE_CAPACITY);
 
         Ok(Self {
@@ -260,6 +281,12 @@ impl Connection {
             .close()
             .map_err(|(_connection, error)| map_storage_error(&error))
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConnectionAccess {
+    ReadOnly,
+    ReadWrite,
 }
 
 /// A transaction that rolls back automatically unless committed.
@@ -689,6 +716,22 @@ fn sqlite_open_flags(flags: CoreOpenFlags) -> SqlOpenFlags {
     mapped
 }
 
+fn readonly_open_flags(flags: CoreOpenFlags) -> CoreOpenFlags {
+    let mut readonly = CoreOpenFlags::READONLY;
+    for retained in [
+        CoreOpenFlags::URI,
+        CoreOpenFlags::MEMORY,
+        CoreOpenFlags::FULLMUTEX,
+        CoreOpenFlags::NOMUTEX,
+        CoreOpenFlags::NOFOLLOW,
+    ] {
+        if flags.contains(retained) {
+            readonly |= retained;
+        }
+    }
+    readonly
+}
+
 fn apply_key(connection: &SqlConnection, key: Option<ResolvedKeyRef<'_>>) -> Result<()> {
     let key = key.ok_or_else(|| {
         Error::new(
@@ -747,7 +790,11 @@ fn verify_database(connection: &SqlConnection) -> Result<()> {
         .map_err(|error| map_open_error(&error))
 }
 
-fn configure_connection(connection: &SqlConnection, plan: &ResolvedOpenPlan) -> Result<()> {
+fn configure_connection(
+    connection: &SqlConnection,
+    plan: &ResolvedOpenPlan,
+    access: ConnectionAccess,
+) -> Result<()> {
     connection
         .pragma_update(None, "foreign_keys", true)
         .map_err(|error| map_storage_error(&error))?;
@@ -760,7 +807,8 @@ fn configure_connection(connection: &SqlConnection, plan: &ResolvedOpenPlan) -> 
         .pragma_update(None, "cache_size", cache_kib)
         .map_err(|error| map_storage_error(&error))?;
 
-    if !plan.flags().contains(CoreOpenFlags::READONLY)
+    if access == ConnectionAccess::ReadWrite
+        && !plan.flags().contains(CoreOpenFlags::READONLY)
         && !plan.flags().contains(CoreOpenFlags::MEMORY)
     {
         connection

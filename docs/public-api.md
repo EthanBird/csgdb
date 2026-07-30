@@ -455,6 +455,74 @@ let result = worker.join().expect("database worker");
 
 中断句柄可以跨线程移动；数据库关闭后再调用会安全地成为空操作。取消只终止当前运行，连接在清理当前 Statement 后仍可继续使用。
 
+### 8.1 有界连接管理
+
+需要并发读取和集中写入调度时，可以选择 `DatabasePool`；普通 `Database` API 不受影响：
+
+```rust
+use csgdb::{DatabasePool, KeySource, PoolOptions, Value};
+
+let pool = DatabasePool::builder("agent.db")
+    .key(KeySource::Raw(database_key))
+    .read_connections(2)
+    .write_queue_capacity(64)
+    .open()?;
+
+pool.execute_batch(
+    "CREATE TABLE IF NOT EXISTS event(
+        id INTEGER PRIMARY KEY,
+        body TEXT NOT NULL
+    );",
+)?;
+
+pool.execute(
+    "INSERT INTO event(body) VALUES (?)",
+    vec![Value::from("tool completed")],
+)?;
+
+let count = pool.query_i64("SELECT count(*) FROM event")?;
+```
+
+打开时先创建一个可写连接并启用 WAL，再使用同一个已解析密钥打开固定数量的文件级只读连接。默认值为 2 个读连接和 64 个等待写任务。内存数据库不支持多连接池，应继续使用单连接 `Database`。
+
+需要流式行或多语句快照时使用读回调：
+
+```rust
+let result = pool.read(|connection| {
+    let transaction = connection.transaction()?;
+    let revision = transaction.query_i64(
+        "SELECT revision FROM agent_state WHERE id = 1",
+    )?;
+    let event_count = transaction.query_i64(
+        "SELECT count(*) FROM event",
+    )?;
+    transaction.commit()?;
+    Ok((revision, event_count))
+})?;
+```
+
+读回调结束时连接自动归还。`try_read` 不等待，池耗尽时返回 `ReadPoolExhausted`。回调不能返回借用连接或 Row 的值。
+
+所有写任务由单个 `csgdb-writer` 线程串行执行。`write` 等待队列空间，`try_write` 立即拒绝，`write_with_policy` 可以指定最长等待时间：
+
+```rust
+use std::time::Duration;
+use csgdb::WriteBackpressure;
+
+let result = pool.write_with_policy(
+    WriteBackpressure::Timeout(Duration::from_millis(50)),
+    move |database| {
+        let transaction = database.transaction()?;
+        transaction.execute_batch(write_batch)?;
+        transaction.commit()
+    },
+);
+```
+
+写回调及返回值必须满足 `Send + 'static`，因此排队参数使用拥有所有权的 `Value`，而不是借用型 `ValueRef`。同一池的递归读返回 `ReentrantRead`，读回调或写回调中的同步写提交返回 `ReentrantWrite`，从结构上阻止自等待死锁。回调 panic 返回 `WriteTaskPanicked`，不会停止写线程。
+
+`stats()` 返回读连接使用量、当前排队任务、写线程活动状态及提交/完成/拒绝计数。`interrupt_writer()` 可从控制线程取消当前写任务。`close()` 只有在其他池克隆全部释放后才成功，否则返回 `ConnectionManagerInUse`。
+
 异步接口通过专用数据库工作线程实现，不要求底层文件 I/O 伪装成异步操作。
 
 ## 9. Agent 扩展
@@ -544,6 +612,20 @@ MIGRATION_INCOMPLETE
 ```
 
 `MISUSE` 表示语句状态不允许当前操作，`RANGE` 表示参数或结果列索引越界，`INTERRUPT` 表示运行中的数据库操作被显式取消。C ABI 的错误数字一经稳定发布，不再重排。
+
+Rust 连接管理器另外使用以下 `ErrorCode`：
+
+```text
+InvalidPoolConfiguration
+ReadPoolExhausted
+WriteQueueFull
+WriteQueueTimeout
+ConnectionManagerClosed
+ConnectionManagerInUse
+WriteTaskPanicked
+ReentrantRead
+ReentrantWrite
+```
 
 ## 12. 版本与兼容承诺
 
