@@ -382,7 +382,17 @@ assert_eq!(db.query_i64("SELECT count(*) FROM memory")?, 1);
 use csgdb::{Collection, Database};
 
 #[derive(Clone, Debug, PartialEq, Collection)]
-#[csgdb(collection = "agent.memory", table = "agent_memory", version = 1)]
+#[csgdb(
+    collection = "agent.memory",
+    table = "agent_memory",
+    version = 1,
+    index(
+        id = "agent.memory.namespace-score",
+        name = "idx_agent_memory_namespace_score",
+        field = "agent.memory.namespace",
+        field = "agent.memory.score"
+    )
+)]
 struct Memory {
     #[csgdb(id = "agent.memory.id", column = "id", primary_key)]
     id: i64,
@@ -422,6 +432,8 @@ db.delete::<Memory>(&1)?;
 - 必须且只能有一个非空 `primary_key`；
 - Schema 规范包含版本、物理名称、类型、可空性和主键约束；
 - 字段先按稳定字段 ID 排序，再在编译期计算 SHA-256；
+- 索引必须声明稳定 `id`、显式物理 `name` 和至少一个有序 `field`；重复 `field` 表示复合索引，增加 `unique` 表示唯一索引；
+- 索引具有独立规范和指纹，不改变基础 Collection 指纹；同一集合版本的索引集合仍必须精确匹配注册表；
 - Rust 类型名、Rust 字段名和声明顺序不进入规范描述；
 - 泛型结构体、元组结构体、嵌套 `Option` 和未支持字段类型在编译期拒绝。
 
@@ -429,12 +441,13 @@ db.delete::<Memory>(&1)?;
 
 `register_collection` 在一个事务中执行：
 
-1. 创建内部 `__csgdb_schema` 注册表；
+1. 创建内部 `__csgdb_schema`、`__csgdb_index_schema` 和 `__csgdb_migration` 注册表；
 2. 创建新表，或检查同名已有表的列集合、声明类型、空值和主键约束；
-3. 持久化集合 ID、表名、版本、32 字节指纹和规范描述；
-4. 提交前再次保证物理表与类型元数据一致。
+3. 创建声明索引并检查目标表、唯一性、有序列、升序、`BINARY` 排序规则以及非表达式、非部分索引约束；
+4. 分别持久化集合与索引的稳定 ID、物理名称、32 字节指纹和规范描述；
+5. 提交前再次保证物理结构与类型元数据一致。
 
-同一集合再次注册时必须完全匹配。`SchemaMismatch` 不会覆盖旧指纹，也不会自动修改表。一个由普通 SQL 预先创建、但物理约束完全兼容的表可以被首次注册接管；不兼容表会令整个注册事务回滚。自动迁移尚未启用，版本变化必须等待显式迁移接口。
+同一集合再次注册时必须完全匹配。`SchemaMismatch` 不会覆盖旧指纹，也不会自动修改表。一个由普通 SQL 预先创建、但物理约束完全兼容的表可以被首次注册接管；不兼容表会令整个注册事务回滚。旧文件只有 `__csgdb_schema` 且当前集合不声明索引时，注册会在同一事务中补齐辅助注册表，不改变业务数据。
 
 显式事务通过 `CollectionCrud` 使用同一套类型化操作：
 
@@ -449,7 +462,66 @@ transaction.commit()?;
 
 `DatabasePool::insert/update/delete` 会先在调用线程完成类型转换，再把拥有所有权的参数交给单写队列，因此仍可参与有界 Group Commit；`get` 使用只读连接。`ReadConnection` 和 `ReadTransaction` 也提供类型化 `get`，后者保持固定 WAL 快照。
 
-`Collection::schema()` 可以读取字段元数据和编译期指纹；`registered_schema(collection_id)` 可以读取数据库中实际登记的版本、指纹与规范描述。指纹用于兼容性判定和迁移前置检查，不是数据完整性签名，也不能替代数据库加密认证。
+`Collection::schema()` 可以读取字段、索引元数据和编译期指纹；`registered_schema(collection_id)` 可以读取数据库中实际登记的版本、指纹与规范描述。指纹用于兼容性判定和迁移前置检查，不是数据完整性签名，也不能替代数据库加密认证。
+
+### 8.2 显式 Collection 迁移
+
+结构变化必须定义旧、新两个 `Collection` 类型。二者使用相同稳定集合 ID，新版本必须严格递增；应用通过一个长期稳定的迁移 ID 提交必要的 DDL 和数据转换：
+
+```rust
+use csgdb::{Collection, Database, MigrationStatus};
+
+#[derive(Collection)]
+#[csgdb(collection = "agent.memory", table = "agent_memory", version = 1)]
+struct MemoryV1 {
+    #[csgdb(id = "agent.memory.id", column = "id", primary_key)]
+    id: i64,
+    #[csgdb(id = "agent.memory.text", column = "text")]
+    text: String,
+}
+
+#[derive(Collection)]
+#[csgdb(
+    collection = "agent.memory",
+    table = "agent_memory",
+    version = 2,
+    index(
+        id = "agent.memory.score",
+        name = "idx_agent_memory_score",
+        field = "agent.memory.score"
+    )
+)]
+struct MemoryV2 {
+    #[csgdb(id = "agent.memory.id", column = "id", primary_key)]
+    id: i64,
+    #[csgdb(id = "agent.memory.text", column = "text")]
+    text: String,
+    #[csgdb(id = "agent.memory.score", column = "score")]
+    score: Option<f64>,
+}
+
+let status = db.migrate_collection::<MemoryV1, MemoryV2, _>(
+    "agent.memory.add-score-v2",
+    |transaction| {
+        transaction.execute_batch(
+            "ALTER TABLE agent_memory ADD COLUMN score REAL",
+        )
+    },
+)?;
+assert_eq!(status, MigrationStatus::Applied);
+```
+
+迁移事务按以下顺序工作：
+
+1. 验证迁移 ID、端点和当前已登记的旧 Schema/索引；
+2. 执行调用方回调；
+3. 验证目标物理表，删除已变化的旧派生索引并建立目标索引；
+4. 更新 Schema/索引注册表并写入无时钟依赖的迁移历史；
+5. 原子提交。
+
+回调返回错误或发生 panic 时，表、数据、索引和历史记录全部回滚。相同迁移 ID 与相同端点成功记录后再次调用会返回 `AlreadyApplied`，且不执行回调；同一 ID 对应不同端点或当前状态不一致返回 `MigrationMismatch`。`DatabasePool::migrate_collection` 在专用写线程执行同一流程，并对普通写入和 Group Commit 形成屏障。
+
+当前接口面向能在短事务内完成的离线迁移。大表影子复制、双写、分段恢复和进程中止后续跑不属于该接口的隐式行为，将由独立的在线迁移状态机提供。
 
 显式密钥：
 
@@ -793,6 +865,18 @@ WriteTaskPanicked
 ReentrantRead
 ReentrantWrite
 ```
+
+Rust 类型化 Schema 与迁移路径使用：
+
+```text
+InvalidFieldValue
+InvalidSchema
+SchemaMismatch
+InvalidMigration
+MigrationMismatch
+```
+
+其中 `InvalidMigration` 表示调用方声明的迁移 ID 或版本端点本身无效；`MigrationMismatch` 表示迁移 ID 已对应其他端点，或数据库当前状态不在声明的旧/新端点上。这些 Rust 枚举当前不映射为新的 C ABI 数字。
 
 ## 12. 版本与兼容承诺
 

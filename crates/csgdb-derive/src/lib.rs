@@ -31,6 +31,15 @@ struct CollectionAttributes {
     table: Option<LitStr>,
     version: Option<LitInt>,
     crate_path: Option<LitStr>,
+    indexes: Vec<IndexAttributes>,
+}
+
+#[derive(Default)]
+struct IndexAttributes {
+    id: Option<LitStr>,
+    name: Option<LitStr>,
+    fields: Vec<LitStr>,
+    unique: bool,
 }
 
 #[derive(Default)]
@@ -48,6 +57,15 @@ struct DerivedField<'input> {
     storage: &'static str,
     nullable: bool,
     primary_key: bool,
+}
+
+struct DerivedIndex {
+    id: String,
+    name: String,
+    columns: Vec<String>,
+    unique: bool,
+    canonical: String,
+    fingerprint: [u8; 32],
 }
 
 #[allow(clippy::too_many_lines)]
@@ -148,6 +166,14 @@ fn expand_collection(input: &DeriveInput) -> syn::Result<TokenStream2> {
     }
     let primary_key = primary_keys[0];
 
+    let indexes = derive_indexes(
+        &collection,
+        &table,
+        attributes.indexes,
+        &derived_fields,
+        input,
+    )?;
+
     let canonical = canonical_schema(&collection, &table, version, &derived_fields);
     let fingerprint = Sha256::digest(canonical.as_bytes());
     let fingerprint_bytes = fingerprint.iter();
@@ -157,6 +183,10 @@ fn expand_collection(input: &DeriveInput) -> syn::Result<TokenStream2> {
     let select_sql = select_sql(&quoted_table, &derived_fields, &primary_key.column);
     let update_sql = update_sql(&quoted_table, &derived_fields, &primary_key.column);
     let delete_sql = delete_sql(&quoted_table, &primary_key.column);
+    let create_index_sql = indexes
+        .iter()
+        .map(|index| create_index_sql(&quoted_table, index))
+        .collect::<Vec<_>>();
 
     let crate_path = if let Some(literal) = attributes.crate_path {
         let path = syn::parse_str::<syn::Path>(&literal.value()).map_err(|_| {
@@ -168,6 +198,7 @@ fn expand_collection(input: &DeriveInput) -> syn::Result<TokenStream2> {
     };
     let name = &input.ident;
     let field_count = derived_fields.len();
+    let index_count = indexes.len();
     let field_schemas = derived_fields.iter().map(|field| {
         let id = &field.id;
         let column = &field.column;
@@ -198,6 +229,24 @@ fn expand_collection(input: &DeriveInput) -> syn::Result<TokenStream2> {
     });
     let primary_key_name = primary_key.rust_name;
     let primary_key_type = primary_key.ty;
+    let index_schemas = indexes.iter().map(|index| {
+        let id = &index.id;
+        let name = &index.name;
+        let columns = &index.columns;
+        let unique = index.unique;
+        let canonical = &index.canonical;
+        let fingerprint = index.fingerprint.iter();
+        quote! {
+            #crate_path::IndexSchema::new(
+                #id,
+                #name,
+                &[#(#columns),*],
+                #unique,
+                #crate_path::SchemaFingerprint::new([#(#fingerprint),*]),
+                #canonical,
+            )
+        }
+    });
 
     Ok(quote! {
         #[automatically_derived]
@@ -209,10 +258,14 @@ fn expand_collection(input: &DeriveInput) -> syn::Result<TokenStream2> {
             const SELECT_BY_KEY_SQL: &'static str = #select_sql;
             const UPDATE_SQL: &'static str = #update_sql;
             const DELETE_BY_KEY_SQL: &'static str = #delete_sql;
+            const CREATE_INDEX_SQL: &'static [&'static str] = &[#(#create_index_sql),*];
 
             fn schema() -> &'static #crate_path::CollectionSchema {
                 static FIELDS: [#crate_path::FieldSchema; #field_count] = [
                     #(#field_schemas),*
+                ];
+                static INDEXES: [#crate_path::IndexSchema; #index_count] = [
+                    #(#index_schemas),*
                 ];
                 static SCHEMA: #crate_path::CollectionSchema = #crate_path::CollectionSchema::new(
                     #collection,
@@ -221,6 +274,7 @@ fn expand_collection(input: &DeriveInput) -> syn::Result<TokenStream2> {
                     #crate_path::SchemaFingerprint::new([#(#fingerprint_bytes),*]),
                     &FIELDS,
                     #canonical,
+                    &INDEXES,
                 );
                 &SCHEMA
             }
@@ -261,10 +315,108 @@ fn parse_collection_attributes(input: &DeriveInput) -> syn::Result<CollectionAtt
                 Ok(())
             } else if meta.path.is_ident("crate") {
                 set_once(&mut result.crate_path, meta.value()?.parse()?, &meta.path)
+            } else if meta.path.is_ident("index") {
+                let mut index = IndexAttributes::default();
+                meta.parse_nested_meta(|nested| {
+                    if nested.path.is_ident("id") {
+                        set_once(&mut index.id, nested.value()?.parse()?, &nested.path)
+                    } else if nested.path.is_ident("name") {
+                        set_once(&mut index.name, nested.value()?.parse()?, &nested.path)
+                    } else if nested.path.is_ident("field") {
+                        index.fields.push(nested.value()?.parse()?);
+                        Ok(())
+                    } else if nested.path.is_ident("unique") {
+                        if index.unique {
+                            return Err(nested.error("duplicate csgdb index unique"));
+                        }
+                        index.unique = true;
+                        Ok(())
+                    } else {
+                        Err(nested.error("unsupported csgdb index attribute"))
+                    }
+                })?;
+                result.indexes.push(index);
+                Ok(())
             } else {
                 Err(meta.error("unsupported csgdb collection attribute"))
             }
         })?;
+    }
+    Ok(result)
+}
+
+fn derive_indexes(
+    collection: &str,
+    table: &str,
+    attributes: Vec<IndexAttributes>,
+    fields: &[DerivedField<'_>],
+    input: &DeriveInput,
+) -> syn::Result<Vec<DerivedIndex>> {
+    let mut result = Vec::with_capacity(attributes.len());
+    let mut ids = HashSet::with_capacity(attributes.len());
+    let mut names = HashSet::with_capacity(attributes.len());
+    for attributes in attributes {
+        let id = required_string(attributes.id, input, "index id")?;
+        let name = required_string(attributes.name, input, "index name")?;
+        validate_stable_name(&id, input, "index id")?;
+        validate_sql_name(&name, input, "index name")?;
+        if name.starts_with("__csgdb_") {
+            return Err(syn::Error::new_spanned(
+                input,
+                "index names beginning with __csgdb_ are reserved",
+            ));
+        }
+        if !ids.insert(id.clone()) {
+            return Err(syn::Error::new_spanned(input, "duplicate csgdb index id"));
+        }
+        if !names.insert(name.clone()) {
+            return Err(syn::Error::new_spanned(input, "duplicate csgdb index name"));
+        }
+        if attributes.fields.is_empty() {
+            return Err(syn::Error::new_spanned(
+                input,
+                "csgdb index requires at least one field",
+            ));
+        }
+
+        let mut field_ids = Vec::with_capacity(attributes.fields.len());
+        let mut columns = Vec::with_capacity(attributes.fields.len());
+        let mut seen_fields = HashSet::with_capacity(attributes.fields.len());
+        for literal in attributes.fields {
+            let field_id = literal.value();
+            if !seen_fields.insert(field_id.clone()) {
+                return Err(syn::Error::new_spanned(
+                    literal,
+                    "duplicate field in csgdb index",
+                ));
+            }
+            let field = fields
+                .iter()
+                .find(|field| field.id == field_id)
+                .ok_or_else(|| {
+                    syn::Error::new_spanned(literal, "csgdb index references an unknown field id")
+                })?;
+            field_ids.push(field_id);
+            columns.push(field.column.clone());
+        }
+        let canonical = canonical_index(
+            collection,
+            table,
+            &id,
+            &name,
+            attributes.unique,
+            &field_ids,
+            &columns,
+        );
+        let fingerprint = Sha256::digest(canonical.as_bytes()).into();
+        result.push(DerivedIndex {
+            id,
+            name,
+            columns,
+            unique: attributes.unique,
+            canonical,
+            fingerprint,
+        });
     }
     Ok(result)
 }
@@ -435,6 +587,37 @@ fn canonical_schema(
     canonical
 }
 
+fn canonical_index(
+    collection: &str,
+    table: &str,
+    id: &str,
+    name: &str,
+    unique: bool,
+    field_ids: &[String],
+    columns: &[String],
+) -> String {
+    let mut canonical = format!(
+        "csgdb-index-v1\ncollection:{}:{collection}\ntable:{}:{table}\nindex:{}:{id}\nname:{}:{name}\nunique:{}\n",
+        collection.len(),
+        table.len(),
+        id.len(),
+        name.len(),
+        u8::from(unique),
+    );
+    for (field, column) in field_ids.iter().zip(columns) {
+        writeln!(
+            canonical,
+            "field:{}:{}:{}:{}",
+            field.len(),
+            field,
+            column.len(),
+            column,
+        )
+        .expect("writing to a String cannot fail");
+    }
+    canonical
+}
+
 fn create_table_sql(table: &str, fields: &[DerivedField<'_>]) -> String {
     let columns = fields
         .iter()
@@ -452,6 +635,20 @@ fn create_table_sql(table: &str, fields: &[DerivedField<'_>]) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!("CREATE TABLE IF NOT EXISTS {table} ({columns})")
+}
+
+fn create_index_sql(table: &str, index: &DerivedIndex) -> String {
+    let unique = if index.unique { "UNIQUE " } else { "" };
+    let columns = index
+        .columns
+        .iter()
+        .map(|column| quote_identifier(column))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "CREATE {unique}INDEX IF NOT EXISTS {} ON {table} ({columns})",
+        quote_identifier(&index.name),
+    )
 }
 
 fn insert_sql(table: &str, fields: &[DerivedField<'_>]) -> String {

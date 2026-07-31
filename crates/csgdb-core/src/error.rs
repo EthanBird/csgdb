@@ -22,6 +22,8 @@ pub enum ErrorCode {
     InvalidPoolConfiguration,
     InvalidSchema,
     SchemaMismatch,
+    InvalidMigration,
+    MigrationMismatch,
     KeyRequired,
     KeyStoreUnavailable,
     PlaintextRequiresOptIn,

@@ -15,3 +15,4 @@ NNNN-short-title.md
 - [0003：可控 WAL 维护与参数化批量事务](0003-controlled-wal-and-batch-transactions.md)
 - [0004：有界 Group Commit 与 WAL 压力维护](0004-bounded-group-commit-and-wal-pressure.md)
 - [0005：显式稳定 Collection Schema 与指纹注册](0005-stable-collection-schema.md)
+- [0006：独立索引契约与显式事务迁移](0006-index-contract-and-explicit-migration.md)
