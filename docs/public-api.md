@@ -523,7 +523,7 @@ pool.execute(
 let count = pool.query_i64("SELECT count(*) FROM event")?;
 ```
 
-打开时先创建一个可写连接并启用 WAL，再使用同一个已解析密钥打开固定数量的文件级只读连接。默认值为 2 个读连接和 64 个等待写任务。内存数据库不支持多连接池，应继续使用单连接 `Database`。
+打开时先创建一个可写连接并启用 WAL，再使用同一个已解析密钥打开固定数量的文件级只读连接。默认值为 2 个读连接和 64 个等待写任务。默认 Group Commit 最多合并 8 个相邻逻辑任务，收集窗口为 250 微秒；默认每 32 次写线程提交运行一次 PASSIVE Checkpoint，未回收 WAL 软上限为 4096 帧。内存数据库不支持多连接池，应继续使用单连接 `Database`。
 
 多个参数化写入可以作为单个队列任务和单个事务提交：
 
@@ -542,7 +542,36 @@ let changes = pool.execute_transaction([
 ])?;
 ```
 
-返回值按输入顺序给出每条语句的变更行数。任一语句的准备、绑定、执行或提交失败都会回滚整个批次。该接口是调用方显式划定的原子批量事务，不会自动合并不同调用方的任务，因此不等同于 Group Commit。
+返回值按输入顺序给出每条语句的变更行数。任一语句的准备、绑定或执行失败都会回滚整个逻辑任务。相邻的 `execute` 与 `execute_transaction` 调用可以共享一个外层物理事务，但每个调用拥有独立 Savepoint 和响应：
+
+- 单个逻辑任务失败时只回滚自己的 Savepoint，同组其他任务仍可提交；
+- 外层提交失败时，所有原本成功的逻辑任务都收到提交错误；
+- 任务数和等待时间同时受 `GroupCommitOptions` 约束；
+- `write`、`write_with_policy`、`execute_batch`、Checkpoint 和配置变更是严格屏障；
+- 队列背压和逻辑任务的提交、完成、拒绝统计不因物理合并而改变。
+
+显式批量事务仍然是调用方定义的原子边界；Group Commit 只减少相邻边界的持久化提交次数，不把两个调用方的失败域合并。
+
+资源与维护参数可以在打开前配置：
+
+```rust
+use csgdb::{GroupCommitOptions, WalMaintenanceOptions};
+use std::time::Duration;
+
+let pool = DatabasePool::builder("agent.db")
+    .key(KeySource::Raw(database_key))
+    .group_commit(GroupCommitOptions::new(
+        16,
+        Duration::from_micros(500),
+    ))
+    .wal_maintenance(WalMaintenanceOptions::new(
+        16,
+        2_048,
+    ))
+    .open()?;
+```
+
+Group Commit 硬上限为 256 个逻辑任务和 20 毫秒等待时间。自动维护只运行 PASSIVE 模式，不等待读者。一次维护发现未回收帧超过软上限后，写线程会在每次后续写入后重试 PASSIVE，直到长快照释放或压力下降。
 
 需要流式行或多语句快照时使用读回调：
 
@@ -580,7 +609,9 @@ let result = pool.write_with_policy(
 
 写回调及返回值必须满足 `Send + 'static`，因此排队参数使用拥有所有权的 `Value`，而不是借用型 `ValueRef`。同一池的递归读返回 `ReentrantRead`，读回调或写回调中的同步写提交返回 `ReentrantWrite`，从结构上阻止自等待死锁。回调 panic 返回 `WriteTaskPanicked`，不会停止写线程。
 
-`checkpoint`、`checkpoint_database` 和 `set_wal_autocheckpoint` 也通过单写线程串行执行，避免与普通写任务同时操作维护状态。`stats()` 返回读连接使用量、当前排队任务、写线程活动状态、提交/完成/拒绝计数，以及 Checkpoint 运行和未完整回收次数。`interrupt_writer()` 可从控制线程取消当前写任务。`close()` 只有在其他池克隆全部释放后才成功，否则返回 `ConnectionManagerInUse`。
+`checkpoint`、`checkpoint_database`、`set_wal_autocheckpoint` 和 `set_automatic_wal_maintenance` 也通过单写线程串行执行，避免与普通写任务同时操作维护状态。调用 `set_wal_autocheckpoint` 会切换到引擎本地策略并关闭管理器自动维护；`set_automatic_wal_maintenance` 会关闭引擎本地阈值并重新启用或替换管理器策略。
+
+`stats()` 返回读连接使用量、当前排队任务、写线程活动状态、提交/完成/拒绝计数、物理 Group Commit 次数、实际合并任务数、最大批次、自动 Checkpoint 次数、维护失败、最近 WAL 帧数、未回收帧数和压力状态。`interrupt_writer()` 可从控制线程取消当前写任务。`close()` 只有在其他池克隆全部释放后才成功，否则返回 `ConnectionManagerInUse`。
 
 异步接口通过专用数据库工作线程实现，不要求底层文件 I/O 伪装成异步操作。
 

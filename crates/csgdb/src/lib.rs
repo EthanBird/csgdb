@@ -7,9 +7,12 @@
 mod pool;
 
 pub use pool::{
-    BatchStatement, DatabasePool, DatabasePoolBuilder, PoolOptions, PoolStats, ReadConnection,
-    ReadTransaction, WriteBackpressure, DEFAULT_READ_CONNECTIONS, DEFAULT_WRITE_QUEUE_CAPACITY,
-    MAX_READ_CONNECTIONS, MAX_WRITE_QUEUE_CAPACITY,
+    BatchStatement, DatabasePool, DatabasePoolBuilder, GroupCommitOptions, PoolOptions, PoolStats,
+    ReadConnection, ReadTransaction, WalMaintenanceOptions, WriteBackpressure,
+    DEFAULT_GROUP_COMMIT_DELAY, DEFAULT_GROUP_COMMIT_MAX_JOBS,
+    DEFAULT_MAINTENANCE_INTERVAL_COMMITS, DEFAULT_READ_CONNECTIONS, DEFAULT_WAL_SOFT_LIMIT_FRAMES,
+    DEFAULT_WRITE_QUEUE_CAPACITY, MAX_GROUP_COMMIT_DELAY, MAX_GROUP_COMMIT_JOBS,
+    MAX_MAINTENANCE_INTERVAL_COMMITS, MAX_READ_CONNECTIONS, MAX_WRITE_QUEUE_CAPACITY,
 };
 
 pub use csgdb_core::{

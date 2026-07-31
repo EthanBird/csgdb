@@ -13,3 +13,4 @@ NNNN-short-title.md
 - [0001：公共接口与安全默认值](0001-public-api-and-secure-defaults.md)
 - [0002：有界连接管理器](0002-bounded-connection-manager.md)
 - [0003：可控 WAL 维护与参数化批量事务](0003-controlled-wal-and-batch-transactions.md)
+- [0004：有界 Group Commit 与 WAL 压力维护](0004-bounded-group-commit-and-wal-pressure.md)

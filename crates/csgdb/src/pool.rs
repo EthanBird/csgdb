@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -17,21 +17,122 @@ use std::time::{Duration, Instant};
 pub const DEFAULT_READ_CONNECTIONS: usize = 2;
 /// Default number of waiting jobs accepted by the single-writer queue.
 pub const DEFAULT_WRITE_QUEUE_CAPACITY: usize = 64;
+/// Default maximum number of logical jobs in one physical group commit.
+pub const DEFAULT_GROUP_COMMIT_MAX_JOBS: usize = 8;
+/// Default time spent waiting for adjacent groupable jobs.
+pub const DEFAULT_GROUP_COMMIT_DELAY: Duration = Duration::from_micros(250);
+/// Default number of writer commits between managed passive checkpoints.
+pub const DEFAULT_MAINTENANCE_INTERVAL_COMMITS: u64 = 32;
+/// Default soft limit for WAL frames that a checkpoint cannot reclaim.
+pub const DEFAULT_WAL_SOFT_LIMIT_FRAMES: u32 = 4_096;
 /// Hard safety limit for read-only connections in one process.
 pub const MAX_READ_CONNECTIONS: usize = 64;
 /// Hard safety limit for waiting write jobs.
 pub const MAX_WRITE_QUEUE_CAPACITY: usize = 65_536;
+/// Hard safety limit for logical jobs in one group commit.
+pub const MAX_GROUP_COMMIT_JOBS: usize = 256;
+/// Hard safety limit for the group-commit collection delay.
+pub const MAX_GROUP_COMMIT_DELAY: Duration = Duration::from_millis(20);
+/// Hard safety limit for managed-checkpoint commit intervals.
+pub const MAX_MAINTENANCE_INTERVAL_COMMITS: u64 = 1_000_000;
 
 thread_local! {
     static IN_WRITE_WORKER: Cell<bool> = const { Cell::new(false) };
     static READ_CALLBACK_POOLS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Resource limits for [`DatabasePool`].
+/// Bounds controlling how adjacent parameterized writes share a commit.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct GroupCommitOptions {
+    max_jobs: usize,
+    max_delay: Duration,
+}
+
+impl GroupCommitOptions {
+    #[must_use]
+    pub const fn new(max_jobs: usize, max_delay: Duration) -> Self {
+        Self {
+            max_jobs,
+            max_delay,
+        }
+    }
+
+    #[must_use]
+    pub const fn max_jobs(self) -> usize {
+        self.max_jobs
+    }
+
+    #[must_use]
+    pub const fn max_delay(self) -> Duration {
+        self.max_delay
+    }
+}
+
+impl Default for GroupCommitOptions {
+    fn default() -> Self {
+        Self::new(DEFAULT_GROUP_COMMIT_MAX_JOBS, DEFAULT_GROUP_COMMIT_DELAY)
+    }
+}
+
+/// Bounded policy for connection-manager-owned passive WAL maintenance.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct WalMaintenanceOptions {
+    enabled: bool,
+    checkpoint_interval_commits: u64,
+    wal_soft_limit_frames: u32,
+}
+
+impl WalMaintenanceOptions {
+    #[must_use]
+    pub const fn new(checkpoint_interval_commits: u64, wal_soft_limit_frames: u32) -> Self {
+        Self {
+            enabled: true,
+            checkpoint_interval_commits,
+            wal_soft_limit_frames,
+        }
+    }
+
+    #[must_use]
+    pub const fn disabled() -> Self {
+        Self {
+            enabled: false,
+            checkpoint_interval_commits: DEFAULT_MAINTENANCE_INTERVAL_COMMITS,
+            wal_soft_limit_frames: DEFAULT_WAL_SOFT_LIMIT_FRAMES,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_enabled(self) -> bool {
+        self.enabled
+    }
+
+    #[must_use]
+    pub const fn checkpoint_interval_commits(self) -> u64 {
+        self.checkpoint_interval_commits
+    }
+
+    #[must_use]
+    pub const fn wal_soft_limit_frames(self) -> u32 {
+        self.wal_soft_limit_frames
+    }
+}
+
+impl Default for WalMaintenanceOptions {
+    fn default() -> Self {
+        Self::new(
+            DEFAULT_MAINTENANCE_INTERVAL_COMMITS,
+            DEFAULT_WAL_SOFT_LIMIT_FRAMES,
+        )
+    }
+}
+
+/// Resource and maintenance limits for [`DatabasePool`].
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct PoolOptions {
     read_connections: usize,
     write_queue_capacity: usize,
+    group_commit: GroupCommitOptions,
+    wal_maintenance: WalMaintenanceOptions,
 }
 
 impl PoolOptions {
@@ -40,6 +141,15 @@ impl PoolOptions {
         Self {
             read_connections,
             write_queue_capacity,
+            group_commit: GroupCommitOptions {
+                max_jobs: DEFAULT_GROUP_COMMIT_MAX_JOBS,
+                max_delay: DEFAULT_GROUP_COMMIT_DELAY,
+            },
+            wal_maintenance: WalMaintenanceOptions {
+                enabled: true,
+                checkpoint_interval_commits: DEFAULT_MAINTENANCE_INTERVAL_COMMITS,
+                wal_soft_limit_frames: DEFAULT_WAL_SOFT_LIMIT_FRAMES,
+            },
         }
     }
 
@@ -51,6 +161,28 @@ impl PoolOptions {
     #[must_use]
     pub const fn write_queue_capacity(self) -> usize {
         self.write_queue_capacity
+    }
+
+    #[must_use]
+    pub const fn group_commit(self) -> GroupCommitOptions {
+        self.group_commit
+    }
+
+    #[must_use]
+    pub const fn wal_maintenance(self) -> WalMaintenanceOptions {
+        self.wal_maintenance
+    }
+
+    #[must_use]
+    pub const fn with_group_commit(mut self, options: GroupCommitOptions) -> Self {
+        self.group_commit = options;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_wal_maintenance(mut self, options: WalMaintenanceOptions) -> Self {
+        self.wal_maintenance = options;
+        self
     }
 }
 
@@ -111,8 +243,18 @@ pub struct PoolStats {
     pub write_jobs_submitted: u64,
     pub write_jobs_completed: u64,
     pub write_jobs_rejected: u64,
+    pub group_commit_transactions: u64,
+    pub grouped_write_jobs: u64,
+    pub largest_group_commit: usize,
     pub checkpoint_runs: u64,
+    pub automatic_checkpoint_runs: u64,
     pub incomplete_checkpoints: u64,
+    pub maintenance_failures: u64,
+    pub wal_pressure_events: u64,
+    pub wal_pressure_active: bool,
+    pub automatic_maintenance_enabled: bool,
+    pub last_observed_wal_frames: u32,
+    pub last_remaining_wal_frames: u32,
 }
 
 /// Builder for an encrypted or explicit-plaintext [`DatabasePool`].
@@ -175,6 +317,18 @@ impl DatabasePoolBuilder {
     #[must_use]
     pub const fn write_queue_capacity(mut self, capacity: usize) -> Self {
         self.pool_options.write_queue_capacity = capacity;
+        self
+    }
+
+    #[must_use]
+    pub const fn group_commit(mut self, options: GroupCommitOptions) -> Self {
+        self.pool_options.group_commit = options;
+        self
+    }
+
+    #[must_use]
+    pub const fn wal_maintenance(mut self, options: WalMaintenanceOptions) -> Self {
+        self.pool_options.wal_maintenance = options;
         self
     }
 
@@ -274,6 +428,9 @@ impl DatabasePool {
         validate_pool_options(plan, options)?;
 
         let writer = Database::open_resolved(plan, false)?;
+        if options.wal_maintenance.enabled {
+            writer.set_wal_autocheckpoint(0)?;
+        }
         let writer_interrupt = writer.interrupt_handle();
         let mut readers = Vec::with_capacity(options.read_connections);
         for _ in 0..options.read_connections {
@@ -285,9 +442,12 @@ impl DatabasePool {
         let metrics = Arc::new(PoolMetrics::default());
         let worker_queue = Arc::clone(&write_queue);
         let worker_metrics = Arc::clone(&metrics);
+        metrics
+            .automatic_maintenance_enabled
+            .store(options.wal_maintenance.enabled, Ordering::Release);
         let writer_thread = thread::Builder::new()
             .name("csgdb-writer".to_owned())
-            .spawn(move || writer_main(writer, &worker_queue, &worker_metrics))
+            .spawn(move || writer_main(writer, &worker_queue, &worker_metrics, options))
             .map_err(|_| {
                 Error::new(
                     ErrorCode::StorageBackendUnavailable,
@@ -395,6 +555,19 @@ impl DatabasePool {
         R: Send + 'static,
         F: FnOnce(&mut Database) -> Result<R> + Send + 'static,
     {
+        self.write_internal(policy, true, move |database, _runtime| operation(database))
+    }
+
+    fn write_internal<R, F>(
+        &self,
+        policy: WriteBackpressure,
+        counts_as_write: bool,
+        operation: F,
+    ) -> Result<R>
+    where
+        R: Send + 'static,
+        F: FnOnce(&mut Database, &mut WriterRuntime) -> Result<R> + Send + 'static,
+    {
         if in_write_worker() || in_read_callback(&self.inner) {
             return Err(Error::new(
                 ErrorCode::ReentrantWrite,
@@ -403,19 +576,24 @@ impl DatabasePool {
         }
 
         let (response_tx, response_rx) = mpsc::sync_channel(1);
-        let metrics = Arc::clone(&self.inner.metrics);
-        let job = Box::new(move |database: &mut Database| {
-            let response = match catch_unwind(AssertUnwindSafe(|| operation(database))) {
-                Ok(result) => result,
-                Err(_) => Err(Error::new(
-                    ErrorCode::WriteTaskPanicked,
-                    "a database writer callback panicked",
-                )),
-            };
-            metrics.writer_active.store(false, Ordering::Release);
-            metrics.write_jobs_completed.fetch_add(1, Ordering::Relaxed);
-            let _ = response_tx.send(response);
-        });
+        let job = WriteJob::Exclusive {
+            operation: Box::new(
+                move |database: &mut Database, runtime: &mut WriterRuntime| {
+                    let response =
+                        match catch_unwind(AssertUnwindSafe(|| operation(database, runtime))) {
+                            Ok(result) => result,
+                            Err(_) => Err(Error::new(
+                                ErrorCode::WriteTaskPanicked,
+                                "a database writer callback panicked",
+                            )),
+                        };
+                    Box::new(move || {
+                        let _ = response_tx.send(response);
+                    })
+                },
+            ),
+            counts_as_write,
+        };
 
         if let Err(error) = self.inner.write_queue.push(job, policy) {
             if matches!(
@@ -462,11 +640,11 @@ impl DatabasePool {
     ///
     /// Returns an error when queueing, binding, or execution fails.
     pub fn execute(&self, sql: impl Into<String>, parameters: Vec<Value>) -> Result<usize> {
-        let sql = sql.into();
-        self.write(move |database| {
-            let parameters = parameters.iter().map(Value::as_ref).collect::<Vec<_>>();
-            database.execute(&sql, &parameters)
-        })
+        let changes = self.submit_groupable(
+            vec![BatchStatement::new(sql, parameters)],
+            WriteBackpressure::Wait,
+        )?;
+        Ok(changes.into_iter().next().unwrap_or(0))
     }
 
     /// Executes owned parameterized statements in one atomic transaction.
@@ -484,20 +662,50 @@ impl DatabasePool {
         statements: impl IntoIterator<Item = BatchStatement>,
     ) -> Result<Vec<usize>> {
         let statements = statements.into_iter().collect::<Vec<_>>();
-        self.write(move |database| {
-            let transaction = database.transaction()?;
-            let mut changes = Vec::with_capacity(statements.len());
-            for statement in statements {
-                let parameters = statement
-                    .parameters
-                    .iter()
-                    .map(Value::as_ref)
-                    .collect::<Vec<_>>();
-                changes.push(transaction.execute(&statement.sql, &parameters)?);
+        self.submit_groupable(statements, WriteBackpressure::Wait)
+    }
+
+    fn submit_groupable(
+        &self,
+        statements: Vec<BatchStatement>,
+        policy: WriteBackpressure,
+    ) -> Result<Vec<usize>> {
+        if in_write_worker() || in_read_callback(&self.inner) {
+            return Err(Error::new(
+                ErrorCode::ReentrantWrite,
+                "a database callback cannot synchronously submit a nested write",
+            ));
+        }
+
+        let (response_tx, response_rx) = mpsc::sync_channel(1);
+        let job = WriteJob::Groupable(GroupableWrite {
+            statements,
+            response: response_tx,
+        });
+        if let Err(error) = self.inner.write_queue.push(job, policy) {
+            if matches!(
+                error.code(),
+                ErrorCode::WriteQueueFull | ErrorCode::WriteQueueTimeout
+            ) {
+                self.inner
+                    .metrics
+                    .write_jobs_rejected
+                    .fetch_add(1, Ordering::Relaxed);
             }
-            transaction.commit()?;
-            Ok(changes)
-        })
+            return Err(error);
+        }
+        self.inner
+            .metrics
+            .write_jobs_submitted
+            .fetch_add(1, Ordering::Relaxed);
+        self.inner.write_queue.notify_writer();
+
+        response_rx.recv().map_err(|_| {
+            Error::new(
+                ErrorCode::ConnectionManagerClosed,
+                "database writer stopped before returning a result",
+            )
+        })?
     }
 
     /// Runs a WAL checkpoint on the writer connection.
@@ -523,14 +731,9 @@ impl DatabasePool {
     ) -> Result<CheckpointResult> {
         let database_name = database_name.map(str::to_owned);
         let metrics = Arc::clone(&self.inner.metrics);
-        self.write(move |database| {
+        self.write_internal(WriteBackpressure::Wait, false, move |database, runtime| {
             let result = database.checkpoint_database(database_name.as_deref(), mode)?;
-            metrics.checkpoint_runs.fetch_add(1, Ordering::Relaxed);
-            if !result.is_complete() {
-                metrics
-                    .incomplete_checkpoints
-                    .fetch_add(1, Ordering::Relaxed);
-            }
+            runtime.record_checkpoint(&metrics, result, false);
             Ok(result)
         })
     }
@@ -543,7 +746,40 @@ impl DatabasePool {
     ///
     /// Returns an error when queueing fails or the threshold is invalid.
     pub fn set_wal_autocheckpoint(&self, frames: u32) -> Result<()> {
-        self.write(move |database| database.set_wal_autocheckpoint(frames))
+        let metrics = Arc::clone(&self.inner.metrics);
+        self.write_internal(WriteBackpressure::Wait, false, move |database, runtime| {
+            database.set_wal_autocheckpoint(frames)?;
+            runtime.disable_automatic_maintenance();
+            metrics
+                .automatic_maintenance_enabled
+                .store(false, Ordering::Release);
+            metrics.wal_pressure_active.store(false, Ordering::Release);
+            Ok(())
+        })
+    }
+
+    /// Replaces the manager-owned automatic WAL maintenance policy.
+    ///
+    /// Enabling this policy disables the engine-local auto-checkpoint and lets
+    /// the writer run bounded PASSIVE checkpoints. A disabled policy leaves
+    /// automatic checkpointing off until explicitly configured otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid limits, queueing failures, or when the
+    /// engine cannot disable its connection-local auto-checkpoint.
+    pub fn set_automatic_wal_maintenance(&self, options: WalMaintenanceOptions) -> Result<()> {
+        validate_wal_maintenance_options(options)?;
+        let metrics = Arc::clone(&self.inner.metrics);
+        self.write_internal(WriteBackpressure::Wait, false, move |database, runtime| {
+            database.set_wal_autocheckpoint(0)?;
+            runtime.set_automatic_maintenance(options);
+            metrics
+                .automatic_maintenance_enabled
+                .store(options.enabled, Ordering::Release);
+            metrics.wal_pressure_active.store(false, Ordering::Release);
+            Ok(())
+        })
     }
 
     /// Interrupts the operation currently running on the writer connection.
@@ -599,11 +835,61 @@ impl DatabasePool {
                 .metrics
                 .write_jobs_rejected
                 .load(Ordering::Relaxed),
+            group_commit_transactions: self
+                .inner
+                .metrics
+                .group_commit_transactions
+                .load(Ordering::Relaxed),
+            grouped_write_jobs: self
+                .inner
+                .metrics
+                .grouped_write_jobs
+                .load(Ordering::Relaxed),
+            largest_group_commit: self
+                .inner
+                .metrics
+                .largest_group_commit
+                .load(Ordering::Relaxed),
             checkpoint_runs: self.inner.metrics.checkpoint_runs.load(Ordering::Relaxed),
+            automatic_checkpoint_runs: self
+                .inner
+                .metrics
+                .automatic_checkpoint_runs
+                .load(Ordering::Relaxed),
             incomplete_checkpoints: self
                 .inner
                 .metrics
                 .incomplete_checkpoints
+                .load(Ordering::Relaxed),
+            maintenance_failures: self
+                .inner
+                .metrics
+                .maintenance_failures
+                .load(Ordering::Relaxed),
+            wal_pressure_events: self
+                .inner
+                .metrics
+                .wal_pressure_events
+                .load(Ordering::Relaxed),
+            wal_pressure_active: self
+                .inner
+                .metrics
+                .wal_pressure_active
+                .load(Ordering::Acquire),
+            automatic_maintenance_enabled: self
+                .inner
+                .metrics
+                .automatic_maintenance_enabled
+                .load(Ordering::Acquire),
+            last_observed_wal_frames: self
+                .inner
+                .metrics
+                .last_observed_wal_frames
+                .load(Ordering::Relaxed),
+            last_remaining_wal_frames: self
+                .inner
+                .metrics
+                .last_remaining_wal_frames
                 .load(Ordering::Relaxed),
         }
     }
@@ -925,7 +1211,44 @@ impl Drop for ReadLease {
     }
 }
 
-type WriteJob = Box<dyn FnOnce(&mut Database) + Send + 'static>;
+type WriteCompletion = Box<dyn FnOnce() + Send + 'static>;
+type ExclusiveWrite =
+    Box<dyn FnOnce(&mut Database, &mut WriterRuntime) -> WriteCompletion + Send + 'static>;
+type GroupWriteResponse = (mpsc::SyncSender<Result<Vec<usize>>>, Result<Vec<usize>>);
+
+struct GroupableWrite {
+    statements: Vec<BatchStatement>,
+    response: mpsc::SyncSender<Result<Vec<usize>>>,
+}
+
+struct GroupCommitCompletion {
+    committed: bool,
+    responses: Vec<GroupWriteResponse>,
+}
+
+impl GroupCommitCompletion {
+    fn finish(self) {
+        for (response, result) in self.responses {
+            let _ = response.send(result);
+        }
+    }
+}
+
+enum WriteJob {
+    Exclusive {
+        operation: ExclusiveWrite,
+        counts_as_write: bool,
+    },
+    Groupable(GroupableWrite),
+}
+
+enum DequeuedWrite {
+    Exclusive {
+        operation: ExclusiveWrite,
+        counts_as_write: bool,
+    },
+    Group(Vec<GroupableWrite>),
+}
 
 struct WriteQueueState {
     jobs: VecDeque<WriteJob>,
@@ -1002,12 +1325,12 @@ impl WriteQueue {
         self.not_empty.notify_one();
     }
 
-    fn pop(&self) -> Option<WriteJob> {
+    fn pop(&self, group_commit: GroupCommitOptions) -> Option<DequeuedWrite> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        loop {
+        let first = loop {
             if let Some(job) = state.jobs.pop_front() {
-                self.not_full.notify_one();
-                return Some(job);
+                self.not_full.notify_all();
+                break job;
             }
             if !state.accepting {
                 return None;
@@ -1016,6 +1339,51 @@ impl WriteQueue {
                 .not_empty
                 .wait(state)
                 .unwrap_or_else(PoisonError::into_inner);
+        };
+
+        match first {
+            WriteJob::Exclusive {
+                operation,
+                counts_as_write,
+            } => Some(DequeuedWrite::Exclusive {
+                operation,
+                counts_as_write,
+            }),
+            WriteJob::Groupable(first) => {
+                let mut jobs = Vec::with_capacity(group_commit.max_jobs);
+                jobs.push(first);
+                let deadline = Instant::now()
+                    .checked_add(group_commit.max_delay)
+                    .unwrap_or_else(Instant::now);
+
+                while jobs.len() < group_commit.max_jobs {
+                    if matches!(state.jobs.front(), Some(WriteJob::Groupable(_))) {
+                        let Some(WriteJob::Groupable(job)) = state.jobs.pop_front() else {
+                            unreachable!("front was verified as groupable");
+                        };
+                        jobs.push(job);
+                        self.not_full.notify_all();
+                        continue;
+                    }
+                    if !state.jobs.is_empty() || !state.accepting {
+                        break;
+                    }
+
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    let (next_state, wait) = self
+                        .not_empty
+                        .wait_timeout(state, remaining)
+                        .unwrap_or_else(PoisonError::into_inner);
+                    state = next_state;
+                    if wait.timed_out() && state.jobs.is_empty() {
+                        break;
+                    }
+                }
+                Some(DequeuedWrite::Group(jobs))
+            }
         }
     }
 
@@ -1041,15 +1409,246 @@ struct PoolMetrics {
     write_jobs_submitted: AtomicU64,
     write_jobs_completed: AtomicU64,
     write_jobs_rejected: AtomicU64,
+    group_commit_transactions: AtomicU64,
+    grouped_write_jobs: AtomicU64,
+    largest_group_commit: AtomicUsize,
     checkpoint_runs: AtomicU64,
+    automatic_checkpoint_runs: AtomicU64,
     incomplete_checkpoints: AtomicU64,
+    maintenance_failures: AtomicU64,
+    wal_pressure_events: AtomicU64,
+    wal_pressure_active: AtomicBool,
+    automatic_maintenance_enabled: AtomicBool,
+    last_observed_wal_frames: AtomicU32,
+    last_remaining_wal_frames: AtomicU32,
 }
 
-fn writer_main(mut database: Database, queue: &WriteQueue, metrics: &PoolMetrics) -> Result<()> {
+struct WriterRuntime {
+    maintenance: WalMaintenanceOptions,
+    commits_since_maintenance: u64,
+    wal_pressure: bool,
+}
+
+impl WriterRuntime {
+    const fn new(maintenance: WalMaintenanceOptions) -> Self {
+        Self {
+            maintenance,
+            commits_since_maintenance: 0,
+            wal_pressure: false,
+        }
+    }
+
+    fn disable_automatic_maintenance(&mut self) {
+        self.maintenance.enabled = false;
+        self.commits_since_maintenance = 0;
+        self.wal_pressure = false;
+    }
+
+    fn set_automatic_maintenance(&mut self, options: WalMaintenanceOptions) {
+        self.maintenance = options;
+        self.commits_since_maintenance = 0;
+        self.wal_pressure = false;
+    }
+
+    fn after_write(&mut self, database: &Database, metrics: &PoolMetrics) {
+        if !self.maintenance.enabled {
+            return;
+        }
+        self.commits_since_maintenance = self.commits_since_maintenance.saturating_add(1);
+        if !self.wal_pressure
+            && self.commits_since_maintenance < self.maintenance.checkpoint_interval_commits
+        {
+            return;
+        }
+        self.commits_since_maintenance = 0;
+
+        match database.checkpoint(CheckpointMode::Passive) {
+            Ok(result) => self.record_checkpoint(metrics, result, true),
+            Err(_) => {
+                metrics.maintenance_failures.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn record_checkpoint(
+        &mut self,
+        metrics: &PoolMetrics,
+        result: CheckpointResult,
+        automatic: bool,
+    ) {
+        metrics.checkpoint_runs.fetch_add(1, Ordering::Relaxed);
+        if automatic {
+            metrics
+                .automatic_checkpoint_runs
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if !result.is_complete() {
+            metrics
+                .incomplete_checkpoints
+                .fetch_add(1, Ordering::Relaxed);
+        }
+
+        let wal_frames = result.wal_frames().unwrap_or(0);
+        let remaining_frames = result.remaining_frames().unwrap_or(0);
+        metrics
+            .last_observed_wal_frames
+            .store(wal_frames, Ordering::Relaxed);
+        metrics
+            .last_remaining_wal_frames
+            .store(remaining_frames, Ordering::Relaxed);
+
+        let pressure = remaining_frames > self.maintenance.wal_soft_limit_frames;
+        if pressure && !self.wal_pressure {
+            metrics.wal_pressure_events.fetch_add(1, Ordering::Relaxed);
+        }
+        self.wal_pressure = pressure;
+        metrics
+            .wal_pressure_active
+            .store(pressure, Ordering::Release);
+    }
+}
+
+fn execute_group_commit(
+    database: &mut Database,
+    jobs: Vec<GroupableWrite>,
+    metrics: &PoolMetrics,
+) -> GroupCommitCompletion {
+    let job_count = jobs.len();
+    let job_count_u64 = u64::try_from(job_count).unwrap_or(u64::MAX);
+    metrics
+        .group_commit_transactions
+        .fetch_add(1, Ordering::Relaxed);
+    metrics
+        .largest_group_commit
+        .fetch_max(job_count, Ordering::Relaxed);
+    if job_count > 1 {
+        metrics
+            .grouped_write_jobs
+            .fetch_add(job_count_u64, Ordering::Relaxed);
+    }
+
+    let transaction = match database.transaction() {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            metrics
+                .write_jobs_completed
+                .fetch_add(job_count_u64, Ordering::Relaxed);
+            return GroupCommitCompletion {
+                committed: false,
+                responses: jobs
+                    .into_iter()
+                    .map(|job| (job.response, Err(error.clone())))
+                    .collect(),
+            };
+        }
+    };
+
+    let mut responses = Vec::with_capacity(job_count);
+    let mut fatal_error: Option<Error> = None;
+    for job in jobs {
+        let result = if let Some(error) = &fatal_error {
+            Err(error.clone())
+        } else {
+            match execute_group_job(&transaction, &job.statements) {
+                Ok(result) => result,
+                Err(error) => {
+                    fatal_error = Some(error.clone());
+                    Err(error)
+                }
+            }
+        };
+        responses.push((job.response, result));
+    }
+
+    let committed = if let Some(error) = fatal_error {
+        drop(transaction);
+        for (_, result) in &mut responses {
+            *result = Err(error.clone());
+        }
+        false
+    } else {
+        match transaction.commit() {
+            Ok(()) => responses.iter().any(|(_, result)| result.is_ok()),
+            Err(error) => {
+                for (_, result) in &mut responses {
+                    if result.is_ok() {
+                        *result = Err(error.clone());
+                    }
+                }
+                false
+            }
+        }
+    };
+
+    metrics
+        .write_jobs_completed
+        .fetch_add(job_count_u64, Ordering::Relaxed);
+    GroupCommitCompletion {
+        committed,
+        responses,
+    }
+}
+
+fn execute_group_job(
+    transaction: &Transaction<'_>,
+    statements: &[BatchStatement],
+) -> std::result::Result<Result<Vec<usize>>, Error> {
+    const SAVEPOINT: &str = "SAVEPOINT csgdb_group_commit_job";
+    const RELEASE: &str = "RELEASE csgdb_group_commit_job";
+    const ROLLBACK: &str = "ROLLBACK TO csgdb_group_commit_job; RELEASE csgdb_group_commit_job";
+
+    transaction.execute_batch(SAVEPOINT)?;
+    let mut changes = Vec::with_capacity(statements.len());
+    for statement in statements {
+        let parameters = statement
+            .parameters
+            .iter()
+            .map(Value::as_ref)
+            .collect::<Vec<_>>();
+        match transaction.execute(&statement.sql, &parameters) {
+            Ok(statement_changes) => changes.push(statement_changes),
+            Err(error) => {
+                transaction.execute_batch(ROLLBACK)?;
+                return Ok(Err(error));
+            }
+        }
+    }
+    transaction.execute_batch(RELEASE)?;
+    Ok(Ok(changes))
+}
+
+fn writer_main(
+    mut database: Database,
+    queue: &WriteQueue,
+    metrics: &PoolMetrics,
+    options: PoolOptions,
+) -> Result<()> {
     IN_WRITE_WORKER.with(|state| state.set(true));
-    while let Some(job) = queue.pop() {
+    let mut runtime = WriterRuntime::new(options.wal_maintenance);
+    while let Some(job) = queue.pop(options.group_commit) {
         metrics.writer_active.store(true, Ordering::Release);
-        job(&mut database);
+        match job {
+            DequeuedWrite::Exclusive {
+                operation,
+                counts_as_write,
+            } => {
+                let completion = operation(&mut database, &mut runtime);
+                if counts_as_write {
+                    runtime.after_write(&database, metrics);
+                }
+                metrics.write_jobs_completed.fetch_add(1, Ordering::Relaxed);
+                metrics.writer_active.store(false, Ordering::Release);
+                completion();
+            }
+            DequeuedWrite::Group(jobs) => {
+                let completion = execute_group_commit(&mut database, jobs, metrics);
+                if completion.committed {
+                    runtime.after_write(&database, metrics);
+                }
+                metrics.writer_active.store(false, Ordering::Release);
+                completion.finish();
+            }
+        }
     }
     IN_WRITE_WORKER.with(|state| state.set(false));
     database.close()
@@ -1078,6 +1677,8 @@ fn validate_pool_options(plan: &ResolvedOpenPlan, options: PoolOptions) -> Resul
             "write queue capacity is outside the supported range",
         ));
     }
+    validate_group_commit_options(options.group_commit)?;
+    validate_wal_maintenance_options(options.wal_maintenance)?;
     if plan.flags().contains(OpenFlags::READONLY) {
         return Err(Error::new(
             ErrorCode::InvalidPoolConfiguration,
@@ -1088,6 +1689,42 @@ fn validate_pool_options(plan: &ResolvedOpenPlan, options: PoolOptions) -> Resul
         return Err(Error::new(
             ErrorCode::InvalidPoolConfiguration,
             "managed pools do not support isolated memory databases",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_group_commit_options(options: GroupCommitOptions) -> Result<()> {
+    if options.max_jobs == 0 || options.max_jobs > MAX_GROUP_COMMIT_JOBS {
+        return Err(Error::new(
+            ErrorCode::InvalidPoolConfiguration,
+            "group commit job limit is outside the supported range",
+        ));
+    }
+    if options.max_delay > MAX_GROUP_COMMIT_DELAY {
+        return Err(Error::new(
+            ErrorCode::InvalidPoolConfiguration,
+            "group commit delay exceeds the supported range",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_wal_maintenance_options(options: WalMaintenanceOptions) -> Result<()> {
+    if options.checkpoint_interval_commits == 0
+        || options.checkpoint_interval_commits > MAX_MAINTENANCE_INTERVAL_COMMITS
+    {
+        return Err(Error::new(
+            ErrorCode::InvalidPoolConfiguration,
+            "WAL maintenance commit interval is outside the supported range",
+        ));
+    }
+    if options.wal_soft_limit_frames == 0
+        || options.wal_soft_limit_frames > crate::MAX_WAL_AUTOCHECKPOINT_FRAMES
+    {
+        return Err(Error::new(
+            ErrorCode::InvalidPoolConfiguration,
+            "WAL soft frame limit is outside the supported range",
         ));
     }
     Ok(())
@@ -1354,6 +1991,212 @@ mod tests {
     }
 
     #[test]
+    fn adjacent_parameterized_writes_share_one_bounded_commit() {
+        let path = TestDatabasePath::new("group-commit");
+        let pool = DatabasePool::builder(path.path())
+            .key(test_key(53))
+            .read_connections(1)
+            .write_queue_capacity(8)
+            .group_commit(GroupCommitOptions::new(2, Duration::from_millis(20)))
+            .wal_maintenance(WalMaintenanceOptions::disabled())
+            .open()
+            .expect("open group commit pool");
+        pool.execute_batch("CREATE TABLE event(value INTEGER NOT NULL UNIQUE);")
+            .expect("create table");
+
+        let (blocker_started_tx, blocker_started_rx) = mpsc::sync_channel(0);
+        let (release_blocker_tx, release_blocker_rx) = mpsc::sync_channel(0);
+        let blocker_pool = pool.clone();
+        let blocker = thread::spawn(move || {
+            blocker_pool.write(move |_| {
+                blocker_started_tx.send(()).expect("signal blocker");
+                release_blocker_rx.recv().expect("release blocker");
+                Ok(())
+            })
+        });
+        blocker_started_rx.recv().expect("blocker started");
+
+        let mut writers = Vec::new();
+        for value in 0_i64..6 {
+            let writer_pool = pool.clone();
+            writers.push(thread::spawn(move || {
+                writer_pool.execute(
+                    "INSERT INTO event(value) VALUES (?)",
+                    vec![Value::Integer(value)],
+                )
+            }));
+        }
+        wait_until(|| pool.stats().queued_writes == 6);
+        release_blocker_tx.send(()).expect("release blocker");
+        blocker.join().expect("blocker thread").expect("blocker");
+        for writer in writers {
+            assert_eq!(writer.join().expect("writer thread").expect("insert"), 1);
+        }
+        wait_until(|| !pool.stats().writer_active);
+
+        assert_eq!(
+            pool.query_i64("SELECT count(*) FROM event")
+                .expect("count rows"),
+            6
+        );
+        let stats = pool.stats();
+        assert_eq!(stats.group_commit_transactions, 3);
+        assert_eq!(stats.grouped_write_jobs, 6);
+        assert_eq!(stats.largest_group_commit, 2);
+    }
+
+    #[test]
+    fn group_commit_savepoints_isolate_one_logical_failure() {
+        let path = TestDatabasePath::new("group-commit-isolation");
+        let pool = DatabasePool::builder(path.path())
+            .key(test_key(54))
+            .read_connections(1)
+            .write_queue_capacity(4)
+            .group_commit(GroupCommitOptions::new(2, Duration::from_millis(20)))
+            .wal_maintenance(WalMaintenanceOptions::disabled())
+            .open()
+            .expect("open group commit pool");
+        pool.execute_batch(
+            "CREATE TABLE memory(body TEXT NOT NULL UNIQUE);
+             INSERT INTO memory(body) VALUES ('existing');",
+        )
+        .expect("initialize table");
+
+        let (blocker_started_tx, blocker_started_rx) = mpsc::sync_channel(0);
+        let (release_blocker_tx, release_blocker_rx) = mpsc::sync_channel(0);
+        let blocker_pool = pool.clone();
+        let blocker = thread::spawn(move || {
+            blocker_pool.write(move |_| {
+                blocker_started_tx.send(()).expect("signal blocker");
+                release_blocker_rx.recv().expect("release blocker");
+                Ok(())
+            })
+        });
+        blocker_started_rx.recv().expect("blocker started");
+
+        let successful_pool = pool.clone();
+        let successful = thread::spawn(move || {
+            successful_pool.execute(
+                "INSERT INTO memory(body) VALUES (?)",
+                vec![Value::from("committed")],
+            )
+        });
+        let failing_pool = pool.clone();
+        let failing = thread::spawn(move || {
+            failing_pool.execute(
+                "INSERT INTO memory(body) VALUES (?)",
+                vec![Value::from("existing")],
+            )
+        });
+        wait_until(|| pool.stats().queued_writes == 2);
+        release_blocker_tx.send(()).expect("release blocker");
+        blocker.join().expect("blocker thread").expect("blocker");
+
+        assert_eq!(
+            successful
+                .join()
+                .expect("successful thread")
+                .expect("successful insert"),
+            1
+        );
+        let error = failing
+            .join()
+            .expect("failing thread")
+            .expect_err("duplicate insert must fail");
+        assert_eq!(error.code(), ErrorCode::ConstraintViolation);
+        assert_eq!(
+            pool.query_i64("SELECT count(*) FROM memory")
+                .expect("count isolated results"),
+            2
+        );
+
+        let stats = pool.stats();
+        assert_eq!(stats.group_commit_transactions, 1);
+        assert_eq!(stats.grouped_write_jobs, 2);
+        assert_eq!(stats.largest_group_commit, 2);
+    }
+
+    #[test]
+    fn managed_passive_checkpoints_observe_and_clear_wal_pressure() {
+        let path = TestDatabasePath::new("managed-wal");
+        let pool = DatabasePool::builder(path.path())
+            .key(test_key(55))
+            .read_connections(1)
+            .write_queue_capacity(4)
+            .group_commit(GroupCommitOptions::new(1, Duration::ZERO))
+            .wal_maintenance(WalMaintenanceOptions::new(1, 1))
+            .open()
+            .expect("open managed WAL pool");
+        pool.execute_batch(
+            "CREATE TABLE event(
+                id INTEGER PRIMARY KEY,
+                body TEXT NOT NULL
+            );
+            INSERT INTO event(body) VALUES ('initial');",
+        )
+        .expect("initialize database");
+        wait_until(|| pool.stats().automatic_checkpoint_runs >= 1);
+        let baseline_checkpoints = pool.stats().automatic_checkpoint_runs;
+
+        let (snapshot_ready_tx, snapshot_ready_rx) = mpsc::sync_channel(0);
+        let (release_snapshot_tx, release_snapshot_rx) = mpsc::sync_channel(0);
+        let reader_pool = pool.clone();
+        let reader = thread::spawn(move || {
+            reader_pool.read(|connection| {
+                let transaction = connection.transaction()?;
+                let visible_rows = transaction.query_i64("SELECT count(*) FROM event")?;
+                snapshot_ready_tx.send(()).expect("signal snapshot");
+                release_snapshot_rx.recv().expect("release snapshot");
+                transaction.commit()?;
+                Ok(visible_rows)
+            })
+        });
+        snapshot_ready_rx.recv().expect("snapshot ready");
+
+        let statements = (0_i64..128).map(|id| {
+            BatchStatement::new(
+                "INSERT INTO event(body) VALUES (?)",
+                vec![Value::Text(format!("{id:04}-{}", "x".repeat(1_024)))],
+            )
+        });
+        pool.execute_transaction(statements)
+            .expect("write behind snapshot");
+        wait_until(|| {
+            let stats = pool.stats();
+            stats.automatic_checkpoint_runs > baseline_checkpoints
+                && stats.wal_pressure_active
+                && stats.last_remaining_wal_frames > 1
+        });
+        let pressured = pool.stats();
+        assert!(pressured.wal_pressure_events >= 1);
+
+        release_snapshot_tx.send(()).expect("release snapshot");
+        assert_eq!(reader.join().expect("reader thread").expect("snapshot"), 1);
+        pool.execute(
+            "INSERT INTO event(body) VALUES (?)",
+            vec![Value::from("after-snapshot")],
+        )
+        .expect("write after snapshot");
+        wait_until(|| {
+            let stats = pool.stats();
+            stats.automatic_checkpoint_runs > pressured.automatic_checkpoint_runs
+                && !stats.wal_pressure_active
+                && stats.last_remaining_wal_frames == 0
+        });
+
+        pool.set_wal_autocheckpoint(0)
+            .expect("switch off managed and engine checkpoints");
+        let disabled_at = pool.stats().automatic_checkpoint_runs;
+        pool.execute(
+            "INSERT INTO event(body) VALUES (?)",
+            vec![Value::from("maintenance-disabled")],
+        )
+        .expect("write with maintenance disabled");
+        assert!(!pool.stats().automatic_maintenance_enabled);
+        assert_eq!(pool.stats().automatic_checkpoint_runs, disabled_at);
+    }
+
+    #[test]
     fn checkpoint_reports_long_snapshot_interference_and_truncates_after_release() {
         let path = TestDatabasePath::new("checkpoint-snapshot");
         let pool = test_pool(path.path(), 52, 1, 8);
@@ -1569,6 +2412,19 @@ mod tests {
 
     #[test]
     fn invalid_pool_limits_fail_before_opening_connections() {
+        let options = PoolOptions::new(3, 12)
+            .with_group_commit(GroupCommitOptions::new(5, Duration::from_micros(400)))
+            .with_wal_maintenance(WalMaintenanceOptions::new(7, 512));
+        assert_eq!(options.read_connections(), 3);
+        assert_eq!(options.write_queue_capacity(), 12);
+        assert_eq!(options.group_commit().max_jobs(), 5);
+        assert_eq!(
+            options.group_commit().max_delay(),
+            Duration::from_micros(400)
+        );
+        assert_eq!(options.wal_maintenance().checkpoint_interval_commits(), 7);
+        assert_eq!(options.wal_maintenance().wal_soft_limit_frames(), 512);
+
         let path = TestDatabasePath::new("invalid-limits");
         let error = DatabasePool::builder(path.path())
             .key(test_key(47))
@@ -1583,6 +2439,41 @@ mod tests {
             .write_queue_capacity(0)
             .open()
             .expect_err("zero queue capacity must fail");
+        assert_eq!(error.code(), ErrorCode::InvalidPoolConfiguration);
+        assert!(!path.path().exists());
+
+        let error = DatabasePool::builder(path.path())
+            .key(test_key(47))
+            .group_commit(GroupCommitOptions::new(0, Duration::ZERO))
+            .open()
+            .expect_err("zero group size must fail");
+        assert_eq!(error.code(), ErrorCode::InvalidPoolConfiguration);
+        assert!(!path.path().exists());
+
+        let error = DatabasePool::builder(path.path())
+            .key(test_key(47))
+            .group_commit(GroupCommitOptions::new(
+                2,
+                MAX_GROUP_COMMIT_DELAY + Duration::from_nanos(1),
+            ))
+            .open()
+            .expect_err("oversized group delay must fail");
+        assert_eq!(error.code(), ErrorCode::InvalidPoolConfiguration);
+        assert!(!path.path().exists());
+
+        let error = DatabasePool::builder(path.path())
+            .key(test_key(47))
+            .wal_maintenance(WalMaintenanceOptions::new(0, 1))
+            .open()
+            .expect_err("zero maintenance interval must fail");
+        assert_eq!(error.code(), ErrorCode::InvalidPoolConfiguration);
+        assert!(!path.path().exists());
+
+        let error = DatabasePool::builder(path.path())
+            .key(test_key(47))
+            .wal_maintenance(WalMaintenanceOptions::new(1, 0))
+            .open()
+            .expect_err("zero WAL soft limit must fail");
         assert_eq!(error.code(), ErrorCode::InvalidPoolConfiguration);
         assert!(!path.path().exists());
     }
