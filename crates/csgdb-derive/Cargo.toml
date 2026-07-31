@@ -1,6 +1,6 @@
 [package]
-name = "csgdb"
-description = "Rust API for the CSGDB embedded agent database"
+name = "csgdb-derive"
+description = "Derive macros for stable CSGDB collection schemas"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,10 +8,14 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+[lib]
+proc-macro = true
+
 [dependencies]
-csgdb-core = { path = "../csgdb-core" }
-csgdb-derive = { path = "../csgdb-derive" }
-csgdb-storage = { path = "../csgdb-storage" }
+proc-macro2 = "1"
+quote = "1"
+sha2 = "0.10"
+syn = { version = "2", features = ["full"] }
 
 [lints]
 workspace = true

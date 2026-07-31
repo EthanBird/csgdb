@@ -374,6 +374,83 @@ tx.commit()?;
 assert_eq!(db.query_i64("SELECT count(*) FROM memory")?, 1);
 ```
 
+### 8.1 类型化 Collection 与 CRUD
+
+需要固定磁盘契约时，可以在基础 SQL 接口之上使用 `Collection`：
+
+```rust
+use csgdb::{Collection, Database};
+
+#[derive(Clone, Debug, PartialEq, Collection)]
+#[csgdb(collection = "agent.memory", table = "agent_memory", version = 1)]
+struct Memory {
+    #[csgdb(id = "agent.memory.id", column = "id", primary_key)]
+    id: i64,
+
+    #[csgdb(id = "agent.memory.namespace", column = "namespace")]
+    namespace: String,
+
+    #[csgdb(id = "agent.memory.text", column = "text")]
+    text: String,
+
+    #[csgdb(id = "agent.memory.score", column = "score")]
+    score: Option<f64>,
+}
+
+let mut db = Database::open_with_passphrase("agent.db", secret)?;
+db.register_collection::<Memory>()?;
+
+db.insert(&Memory {
+    id: 1,
+    namespace: "default".to_owned(),
+    text: "first memory".to_owned(),
+    score: Some(0.9),
+})?;
+
+let mut memory = db.get::<Memory>(&1)?.expect("record exists");
+memory.score = None;
+db.update(&memory)?;
+db.delete::<Memory>(&1)?;
+```
+
+当前 derive 支持 `i8/i16/i32/i64`、`u8/u16/u32/u64`、`f32/f64`、`bool`、`String`、`Vec<u8>` 及其单层 `Option<T>`。无符号整数在写入前检查是否超出数据库有符号 64 位整数范围；读取时不进行跨存储类型隐式转换，非法布尔值和数值越界返回稳定错误。
+
+持久化身份遵循以下规则：
+
+- `collection`、`table`、每个字段的 `id` 和 `column` 必须显式提供；
+- `__csgdb_` 表名前缀由内部元数据保留，一个物理表只能登记给一个稳定集合 ID；
+- 必须且只能有一个非空 `primary_key`；
+- Schema 规范包含版本、物理名称、类型、可空性和主键约束；
+- 字段先按稳定字段 ID 排序，再在编译期计算 SHA-256；
+- Rust 类型名、Rust 字段名和声明顺序不进入规范描述；
+- 泛型结构体、元组结构体、嵌套 `Option` 和未支持字段类型在编译期拒绝。
+
+依赖通常命名为 `csgdb`。如果调用方在 `Cargo.toml` 中使用了别名，可以在结构体属性中增加 `crate = "别名"`，让宏生成对应路径，而无需额外的运行时依赖。
+
+`register_collection` 在一个事务中执行：
+
+1. 创建内部 `__csgdb_schema` 注册表；
+2. 创建新表，或检查同名已有表的列集合、声明类型、空值和主键约束；
+3. 持久化集合 ID、表名、版本、32 字节指纹和规范描述；
+4. 提交前再次保证物理表与类型元数据一致。
+
+同一集合再次注册时必须完全匹配。`SchemaMismatch` 不会覆盖旧指纹，也不会自动修改表。一个由普通 SQL 预先创建、但物理约束完全兼容的表可以被首次注册接管；不兼容表会令整个注册事务回滚。自动迁移尚未启用，版本变化必须等待显式迁移接口。
+
+显式事务通过 `CollectionCrud` 使用同一套类型化操作：
+
+```rust
+use csgdb::CollectionCrud;
+
+let transaction = db.transaction()?;
+transaction.insert(&memory)?;
+let saved = transaction.get::<Memory>(&memory.id)?;
+transaction.commit()?;
+```
+
+`DatabasePool::insert/update/delete` 会先在调用线程完成类型转换，再把拥有所有权的参数交给单写队列，因此仍可参与有界 Group Commit；`get` 使用只读连接。`ReadConnection` 和 `ReadTransaction` 也提供类型化 `get`，后者保持固定 WAL 快照。
+
+`Collection::schema()` 可以读取字段元数据和编译期指纹；`registered_schema(collection_id)` 可以读取数据库中实际登记的版本、指纹与规范描述。指纹用于兼容性判定和迁移前置检查，不是数据完整性签名，也不能替代数据库加密认证。
+
 显式密钥：
 
 ```rust

@@ -8,7 +8,7 @@
 
 当前处于 M1。已经完成：
 
-- Rust Workspace 和 `csgdb`、`csgdb-core`、`csgdb-ffi`、`csgdb-cli` crate；
+- Rust Workspace 和 `csgdb`、`csgdb-core`、`csgdb-derive`、`csgdb-ffi`、`csgdb-cli` crate；
 - 默认加密、显式明文、冲突标志拒绝和失败关闭策略；
 - 原始密钥、口令和平台密钥提供器的公共抽象；
 - SQLCipher 事务内核适配和真实 `.db` 文件读写；
@@ -35,11 +35,17 @@
 - Group Commit 最大任务数、最大等待时间和物理事务统计；
 - 默认非阻塞 PASSIVE 自动维护、WAL 软上限和压力恢复观测；
 - 手动 Checkpoint、普通写回调和 DDL 对 Group Commit 的屏障语义；
+- `derive(Collection)` 显式稳定集合、表、字段和主键元数据；
+- 支持整数、浮点、布尔、文本、Blob 与可空字段的严格编解码；
+- SHA-256 Schema 指纹和受保护的 `__csgdb_schema` 持久化注册表；
+- Rust 符号重命名、字段重排不改变 Schema 指纹的兼容性验证；
+- 单连接、显式事务、只读快照和连接池上的类型安全 CRUD；
+- 不兼容注册指纹、物理表漂移和越界字段值的稳定错误分类；
 - 加密文件头、正确密钥重开、错误密钥拒绝和明文兼容测试；
 - 经实际构建验证的 Rust 1.82 最低工具链；
 - 格式、Clippy、测试、文档和 C 头文件检查的 CI。
 
-当前仍是开发版本。尚未完成平台密钥库适配、类型化 Schema、基础 CRUD、Schema 指纹和断电故障注入。下一切片优先实现 `derive(Collection)` 的稳定元数据模型、类型安全 CRUD 和可持久化 Schema 指纹，为后续迁移与查询 IR 建立边界。
+当前仍是开发版本。尚未完成平台密钥库适配、显式 Schema 迁移、索引元数据、断电故障注入和查询 IR。下一切片优先建立迁移计划与索引描述边界，并为 Schema 注册和迁移补充进程中止、重开与旧文件兼容测试。
 
 ## M0：规格与工程骨架
 

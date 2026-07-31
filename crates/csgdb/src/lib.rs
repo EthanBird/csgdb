@@ -4,7 +4,16 @@
 //! transactions, and optional bounded connection management over the bundled
 //! encrypted storage kernel.
 
+extern crate self as csgdb;
+
+mod collection;
 mod pool;
+
+pub use collection::{
+    Collection, CollectionCrud, CollectionSchema, ColumnType, FieldSchema, FieldValue,
+    RegisteredSchema, SchemaFingerprint, SchemaRegistration,
+};
+pub use csgdb_derive::Collection;
 
 pub use pool::{
     BatchStatement, DatabasePool, DatabasePoolBuilder, GroupCommitOptions, PoolOptions, PoolStats,

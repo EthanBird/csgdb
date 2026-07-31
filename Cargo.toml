@@ -3,6 +3,7 @@ members = [
     "crates/csgdb",
     "crates/csgdb-cli",
     "crates/csgdb-core",
+    "crates/csgdb-derive",
     "crates/csgdb-ffi",
     "crates/csgdb-storage",
 ]
