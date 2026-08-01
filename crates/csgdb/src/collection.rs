@@ -701,6 +701,15 @@ pub trait Collection: Sized {
     #[doc(hidden)]
     const CREATE_INDEX_SQL: &'static [&'static str];
 
+    /// Starts a typed query draft for this collection.
+    ///
+    /// The draft cannot execute until a mandatory result bound is supplied
+    /// with [`crate::QueryDraft::take`].
+    #[must_use]
+    fn query() -> crate::QueryDraft<Self> {
+        crate::QueryDraft::new()
+    }
+
     fn schema() -> &'static CollectionSchema;
 
     #[doc(hidden)]
@@ -1483,7 +1492,7 @@ fn validate_physical_table(transaction: &Transaction<'_>, schema: &CollectionSch
     Ok(())
 }
 
-fn validate_collection_schema(schema: &CollectionSchema) -> Result<()> {
+pub(crate) fn validate_collection_schema(schema: &CollectionSchema) -> Result<()> {
     if !valid_name(schema.id())
         || !valid_name(schema.table())
         || schema.table().starts_with("__csgdb_")

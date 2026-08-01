@@ -457,7 +457,7 @@ assert_eq!(
 
 `FIELD_*` 名称属于 Rust 源码 API，字段重命名会相应改变常量名；`CollectionField::id()` 才是持久化和序列化查询计划使用的稳定身份。两个不同 Rust 记录类型可以通过 `same_storage_field` 判断是否仍指向相同集合 ID 与字段 ID。宏会拒绝大小写归一后产生同名 `FIELD_*` 的字段组合。
 
-当前句柄只建立安全身份和类型边界，不直接执行查询，也不允许把未经验证的 SQL 片段塞入 IR。结构化比较、布尔组合、排序和投影将在查询 IR 层基于这些句柄构造。
+字段句柄既是安全身份边界，也是结构化谓词和排序的唯一字段入口；查询 IR 不接受未经验证的 SQL 片段。
 
 依赖通常命名为 `csgdb`。如果调用方在 `Cargo.toml` 中使用了别名，可以在结构体属性中增加 `crate = "别名"`，让宏生成对应路径，而无需额外的运行时依赖。
 
@@ -486,7 +486,39 @@ transaction.commit()?;
 
 `Collection::schema()` 可以读取字段、索引元数据和编译期指纹；`registered_schema(collection_id)` 可以读取数据库中实际登记的版本、指纹与规范描述。指纹用于兼容性判定和迁移前置检查，不是数据完整性签名，也不能替代数据库加密认证。
 
-### 8.2 显式 Collection 迁移
+### 8.2 有界类型化查询
+
+已注册集合可以使用不接受原始 SQL 的类型化查询入口：
+
+```rust
+let query = Memory::query()
+    .filter(
+        Memory::FIELD_NAMESPACE
+            .eq("default")?
+            .and(Memory::FIELD_SCORE.ge(Some(0.8))?),
+    )
+    .order_by(Memory::FIELD_SCORE.desc())
+    .take(24)?;
+
+let memories = db.query_collection(&query)?;
+# Ok::<(), csgdb::Error>(())
+```
+
+兼容性边界如下：
+
+- SQL/Statement 接口继续作为完整的底层能力，不受类型化 API 限制；
+- 类型化查询只使用稳定 Schema 字段，不接受表名、列名或 SQL 片段输入；
+- 所有比较值都参数绑定，`CollectionQuery` 拥有这些值并可安全复用；
+- `take` 是从草稿到可执行计划的强制步骤，当前最大 10,000 行；
+- 默认主键排序确保相同快照上的结果顺序可重复；
+- `Database`、`DatabasePool`、`ReadConnection` 和 `ReadTransaction` 有同名便捷方法；
+- 显式 `Transaction` 通过 `CollectionQueryExecutor` trait 使用相同接口。
+
+比较操作包括 `eq/ne/lt/le/gt/ge`，可空字段另有 `is_null/is_not_null`；谓词可以使用 `and/or/not` 组合。构建阶段限制谓词节点、深度和排序字段数，并拒绝伪造字段元数据、重复排序和非法 `NULL` 大小比较。`Predicate` 不实现 `Debug`，`CollectionQuery` 的调试输出不包含绑定值。
+
+这一层当前返回有界 `Vec<C>`。面向大型结果的主键游标与流式 API 会在保持硬预算的前提下单独加入。
+
+### 8.3 显式 Collection 迁移
 
 结构变化必须定义旧、新两个 `Collection` 类型。二者使用相同稳定集合 ID，新版本必须严格递增；应用通过一个长期稳定的迁移 ID 提交必要的 DDL 和数据转换：
 
@@ -666,7 +698,7 @@ let result = worker.join().expect("database worker");
 
 中断句柄可以跨线程移动；数据库关闭后再调用会安全地成为空操作。取消只终止当前运行，连接在清理当前 Statement 后仍可继续使用。
 
-### 8.1 有界连接管理
+### 8.4 有界连接管理
 
 需要并发读取和集中写入调度时，可以选择 `DatabasePool`；普通 `Database` API 不受影响：
 
@@ -892,13 +924,14 @@ Rust 类型化 Schema 与迁移路径使用：
 
 ```text
 InvalidFieldValue
+InvalidQuery
 InvalidSchema
 SchemaMismatch
 InvalidMigration
 MigrationMismatch
 ```
 
-其中 `InvalidMigration` 表示调用方声明的迁移 ID 或版本端点本身无效；`MigrationMismatch` 表示迁移 ID 已对应其他端点，或数据库当前状态不在声明的旧/新端点上。这些 Rust 枚举当前不映射为新的 C ABI 数字。
+其中 `InvalidQuery` 表示类型化计划元数据无效或超过安全上限；`InvalidMigration` 表示调用方声明的迁移 ID 或版本端点本身无效；`MigrationMismatch` 表示迁移 ID 已对应其他端点，或数据库当前状态不在声明的旧/新端点上。这些 Rust 枚举当前不映射为新的 C ABI 数字。
 
 ## 12. 版本与兼容承诺
 

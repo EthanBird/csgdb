@@ -8,6 +8,7 @@ extern crate self as csgdb;
 
 mod collection;
 mod pool;
+mod query;
 
 pub use collection::{
     Collection, CollectionCrud, CollectionField, CollectionSchema, ColumnType, FieldSchema,
@@ -15,6 +16,11 @@ pub use collection::{
     SchemaRegistration,
 };
 pub use csgdb_derive::Collection;
+pub use query::{
+    CollectionQuery, CollectionQueryExecutor, IntoQueryValue, OrderDirection, OrderedFieldValue,
+    Predicate, QueryDraft, QueryOrder, MAX_PREDICATE_DEPTH, MAX_PREDICATE_NODES, MAX_QUERY_LIMIT,
+    MAX_QUERY_ORDER_FIELDS,
+};
 
 pub use pool::{
     BatchStatement, DatabasePool, DatabasePoolBuilder, GroupCommitOptions, PoolOptions, PoolStats,

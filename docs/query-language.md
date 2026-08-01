@@ -14,7 +14,7 @@ CSG-Q 是类型化混合查询系统，不是 SQL 字符串生成器。它需要
 
 ## 2. 双前端
 
-### 2.0 已实现的字段身份基础
+### 2.0 已实现的有界类型化查询
 
 `#[derive(Collection)]` 已为每个字段生成类型化句柄：
 
@@ -27,15 +27,37 @@ assert_eq!(field.column(), "namespace");
 
 其具体类型是 `CollectionField<Memory, String>`。因此集合和字段值类型可以直接参与 Rust 泛型检查，而稳定字段 ID 可以进入可序列化查询计划；物理列名只由已注册 Schema 解析，不作为 Agent 输入。字段句柄保持为一个静态元数据指针的大小，不在普通记录访问路径执行哈希或注册表查询。
 
-这一层刻意不提供字符串拼接或立即执行。下一步的 `Predicate`、`Order` 和 `Projection` IR 将以 `CollectionField` 为唯一字段入口，类似：
+字段句柄已经可以直接构造谓词和排序：
 
-```rust,ignore
+```rust
 let predicate = Memory::FIELD_NAMESPACE
-    .eq(namespace)
-    .and(Memory::FIELD_SCORE.ge(0.7));
+    .eq("session")?
+    .and(Memory::FIELD_SCORE.ge(Some(0.7))?)
+    .and(Memory::FIELD_DELETED.eq(false)?);
+
+let query = Memory::query()
+    .filter(predicate)
+    .order_by(Memory::FIELD_SCORE.desc())
+    .take(32)?;
+
+let rows = db.query_collection(&query)?;
+# Ok::<(), csgdb::Error>(())
 ```
 
-上例是下一切片接口方向，不是当前已稳定 API。
+`QueryDraft` 没有执行接口，只有调用 `take(1..=10_000)` 后才得到 `CollectionQuery`。当前实现支持：
+
+- `eq`、`ne`；
+- 对有序字段使用 `lt`、`le`、`gt`、`ge`；
+- 可空字段的 `is_null`、`is_not_null`；
+- `and`、`or`、`not`；
+- 多字段 `order_by`；
+- 单连接、显式事务、连接池、只读连接和只读快照执行。
+
+文本和 Blob 可以直接传入 `&str`、`&[u8]`，构建后的查询拥有绑定值。值不会拼入 SQL；调试输出也不会打印值。自定义排序会自动追加主键作为稳定的最终排序键，未指定排序时直接按主键升序。
+
+当前安全上限为 10,000 行、256 个谓词节点、32 层谓词深度和 8 个调用方排序字段。伪造字段元数据、重复排序字段、非有限浮点比较值、对 `NULL` 使用大小比较或超过任一上限都会返回 `ErrorCode::InvalidQuery`。
+
+显式投影、主键游标分页、流式结果和动态 AgentPlan 尚未进入稳定 API。
 
 ### 2.1 Rust 编译期 DSL
 

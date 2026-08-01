@@ -14,6 +14,7 @@ pub enum ErrorCode {
     InvalidColumnIndex,
     InvalidColumnType,
     InvalidFieldValue,
+    InvalidQuery,
     InvalidUtf8,
     InvalidStatementState,
     InvalidBusyTimeout,

@@ -1754,6 +1754,7 @@ fn error_code(error: &Error) -> i32 {
         | ErrorCode::InvalidSql
         | ErrorCode::ParameterCountMismatch
         | ErrorCode::InvalidColumnType
+        | ErrorCode::InvalidQuery
         | ErrorCode::InvalidUtf8
         | ErrorCode::InvalidBusyTimeout
         | ErrorCode::InvalidCheckpointThreshold
