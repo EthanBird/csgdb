@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "date": "2026-08-01",
+  "baseline": "benchmarks/results/2026-08-01-performance-optimization.json",
+  "environment": {
+    "arch": "x86_64",
+    "cpu": "AMD EPYC 9V74",
+    "virtualization": "KVM",
+    "system_sqlite": "3.45.1",
+    "csgdb_storage_sqlite": "3.50.4",
+    "openssl": "3.0.13",
+    "filesystem": "ext4",
+    "build": "release",
+    "csgdb_kernel_flags": [
+      "THREADSAFE=2",
+      "DEFAULT_MEMSTATUS=0",
+      "DISABLE_PAGECACHE_OVERFLOW_STATS",
+      "OMIT_ENABLE_MEMORY_MANAGEMENT",
+      "OMIT_ENABLE_API_ARMOR"
+    ],
+    "encryption_profile": "AES-256-CBC+HMAC-SHA256",
+    "encrypted_page_bytes": 1024
+  },
+  "workload": {
+    "rows": 100000,
+    "payload_bytes": 160,
+    "cache_bytes_per_connection": 4194304,
+    "point_reads": 200000,
+    "range_scans": 5000,
+    "range_rows_per_scan": 100,
+    "updates": 100000,
+    "durable_writes": 1000,
+    "stress_reader_threads": 4,
+    "stress_writer_threads": 1,
+    "stress_rows_per_commit": 32,
+    "stress_seconds": 10,
+    "warmups_per_engine": 1,
+    "measured_repetitions": 3
+  },
+  "rounds": [
+    {"round":1,"engine":"sqlite","open_ms":0.285,"bulk_insert_ms":241.833,"durable_autocommit_ms":2516.199,"point_read_ms":432.675,"range_scan_ms":331.693,"update_ms":351.238,"stress_seconds":10.003,"stress_reads":7834046,"stress_writes":160448,"stress_commits":5014,"stress_errors":0,"read_p50_us":2.233,"read_p95_us":17.306,"read_p99_us":43.455,"commit_p50_us":854.684,"commit_p95_us":9566.361,"commit_p99_us":18228.163,"database_bytes":20271104,"max_rss_kib":51120,"integrity_ok":true},
+    {"round":1,"engine":"csgdb-plaintext","open_ms":6.241,"bulk_insert_ms":204.371,"durable_autocommit_ms":1635.027,"point_read_ms":434.336,"range_scan_ms":383.643,"update_ms":355.807,"stress_seconds":10.009,"stress_reads":11337859,"stress_writes":188064,"stress_commits":5877,"stress_errors":0,"read_p50_us":2.044,"read_p95_us":4.777,"read_p99_us":29.774,"commit_p50_us":178.827,"commit_p95_us":11558.190,"commit_p99_us":36672.093,"database_bytes":20275200,"max_rss_kib":56760,"integrity_ok":true},
+    {"round":1,"engine":"csgdb-encrypted","open_ms":11.835,"bulk_insert_ms":375.252,"durable_autocommit_ms":2160.118,"point_read_ms":643.546,"range_scan_ms":1053.799,"update_ms":875.101,"stress_seconds":10.001,"stress_reads":8071042,"stress_writes":175744,"stress_commits":5492,"stress_errors":0,"read_p50_us":3.756,"read_p95_us":7.371,"read_p99_us":21.592,"commit_p50_us":364.153,"commit_p95_us":10031.775,"commit_p99_us":32962.062,"database_bytes":22296576,"max_rss_kib":51784,"integrity_ok":true},
+    {"round":2,"engine":"csgdb-encrypted","open_ms":5.924,"bulk_insert_ms":340.433,"durable_autocommit_ms":1707.569,"point_read_ms":685.441,"range_scan_ms":1082.682,"update_ms":1103.189,"stress_seconds":10.014,"stress_reads":7040586,"stress_writes":204512,"stress_commits":6391,"stress_errors":0,"read_p50_us":4.367,"read_p95_us":8.192,"read_p99_us":29.223,"commit_p50_us":360.097,"commit_p95_us":6536.484,"commit_p99_us":23832.337,"database_bytes":22296576,"max_rss_kib":52256,"integrity_ok":true},
+    {"round":2,"engine":"sqlite","open_ms":1.847,"bulk_insert_ms":229.438,"durable_autocommit_ms":1789.012,"point_read_ms":457.883,"range_scan_ms":376.769,"update_ms":368.604,"stress_seconds":10.001,"stress_reads":8097648,"stress_writes":177824,"stress_commits":5557,"stress_errors":0,"read_p50_us":2.163,"read_p95_us":16.495,"read_p99_us":44.386,"commit_p50_us":821.284,"commit_p95_us":4430.284,"commit_p99_us":17678.213,"database_bytes":20271104,"max_rss_kib":45656,"integrity_ok":true},
+    {"round":2,"engine":"csgdb-plaintext","open_ms":6.269,"bulk_insert_ms":211.176,"durable_autocommit_ms":714.025,"point_read_ms":353.792,"range_scan_ms":393.790,"update_ms":624.018,"stress_seconds":10.011,"stress_reads":12157223,"stress_writes":260032,"stress_commits":8126,"stress_errors":0,"read_p50_us":1.983,"read_p95_us":4.086,"read_p99_us":33.270,"commit_p50_us":165.206,"commit_p95_us":2349.713,"commit_p99_us":26646.011,"database_bytes":20275200,"max_rss_kib":56568,"integrity_ok":true},
+    {"round":3,"engine":"csgdb-plaintext","open_ms":5.288,"bulk_insert_ms":217.242,"durable_autocommit_ms":932.689,"point_read_ms":435.751,"range_scan_ms":395.590,"update_ms":430.032,"stress_seconds":10.018,"stress_reads":13327462,"stress_writes":211904,"stress_commits":6622,"stress_errors":0,"read_p50_us":1.643,"read_p95_us":2.945,"read_p99_us":25.959,"commit_p50_us":162.532,"commit_p95_us":11778.538,"commit_p99_us":30970.815,"database_bytes":20275200,"max_rss_kib":56864,"integrity_ok":true},
+    {"round":3,"engine":"csgdb-encrypted","open_ms":3.716,"bulk_insert_ms":338.162,"durable_autocommit_ms":799.317,"point_read_ms":690.814,"range_scan_ms":1188.645,"update_ms":931.062,"stress_seconds":10.013,"stress_reads":7664683,"stress_writes":307808,"stress_commits":9619,"stress_errors":0,"read_p50_us":4.156,"read_p95_us":7.301,"read_p99_us":28.913,"commit_p50_us":290.523,"commit_p95_us":1854.314,"commit_p99_us":19907.967,"database_bytes":22296576,"max_rss_kib":52380,"integrity_ok":true},
+    {"round":3,"engine":"sqlite","open_ms":0.423,"bulk_insert_ms":222.117,"durable_autocommit_ms":861.989,"point_read_ms":417.993,"range_scan_ms":371.620,"update_ms":381.725,"stress_seconds":10.011,"stress_reads":7941724,"stress_writes":216384,"stress_commits":6762,"stress_errors":0,"read_p50_us":2.273,"read_p95_us":16.274,"read_p99_us":41.572,"commit_p50_us":782.186,"commit_p95_us":3394.360,"commit_p99_us":16846.884,"database_bytes":20271104,"max_rss_kib":47912,"integrity_ok":true}
+  ],
+  "medians": [
+    {"engine":"sqlite","open_ms":0.423,"bulk_insert_ms":229.438,"durable_autocommit_ms":1789.012,"point_read_ms":432.675,"range_scan_ms":371.620,"update_ms":368.604,"stress_reads":7941724,"stress_writes":177824,"read_p50_us":2.233,"read_p95_us":16.495,"read_p99_us":43.455,"commit_p50_us":821.284,"commit_p95_us":4430.284,"commit_p99_us":17678.213,"database_bytes":20271104,"max_rss_kib":47912},
+    {"engine":"csgdb-plaintext","open_ms":6.241,"bulk_insert_ms":211.176,"durable_autocommit_ms":932.689,"point_read_ms":434.336,"range_scan_ms":393.790,"update_ms":430.032,"stress_reads":12157223,"stress_writes":211904,"read_p50_us":1.983,"read_p95_us":4.086,"read_p99_us":29.774,"commit_p50_us":165.206,"commit_p95_us":11558.190,"commit_p99_us":30970.815,"database_bytes":20275200,"max_rss_kib":56760},
+    {"engine":"csgdb-encrypted","open_ms":5.924,"bulk_insert_ms":340.433,"durable_autocommit_ms":1707.569,"point_read_ms":685.441,"range_scan_ms":1082.682,"update_ms":931.062,"stress_reads":7664683,"stress_writes":204512,"read_p50_us":4.156,"read_p95_us":7.371,"read_p99_us":28.913,"commit_p50_us":360.097,"commit_p95_us":6536.484,"commit_p99_us":23832.337,"database_bytes":22296576,"max_rss_kib":52256}
+  ],
+  "encrypted_60_second_soak": {
+    "stress_seconds": 60.021,
+    "stress_reads": 48000758,
+    "stress_writes": 1865856,
+    "stress_commits": 58308,
+    "stress_errors": 0,
+    "read_p50_us": 3.846,
+    "read_p95_us": 7.181,
+    "read_p99_us": 28.633,
+    "commit_p50_us": 281.500,
+    "commit_p95_us": 4354.502,
+    "commit_p99_us": 19016.588,
+    "database_bytes": 22296576,
+    "max_rss_kib": 52488,
+    "integrity_ok": true
+  },
+  "profiling": {
+    "tool": "gprofng",
+    "encrypted_page_bytes": 1024,
+    "exclusive_cpu_percent": {
+      "sha256_compression": 17.43,
+      "pread": 13.58,
+      "cipher_provider_core": 5.73,
+      "pthread_mutex_lock": 5.81,
+      "openssl_cleanse": 3.14
+    },
+    "inclusive_cpu_percent": {
+      "page_codec": 39.09,
+      "page_hmac": 22.61,
+      "page_cipher": 12.32
+    }
+  }
+}

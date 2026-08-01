@@ -122,12 +122,19 @@ impl Connection {
                 Ok(()) => inner,
                 Err(primary_error) if legacy_candidate => {
                     drop(inner);
-                    let legacy = open_engine_connection(plan, flags)?;
-                    apply_key_with_profile(&legacy, plan, CipherProfile::Legacy)?;
-                    if verify_database(&legacy).is_ok() {
-                        legacy
+                    let previous = open_engine_connection(plan, flags)?;
+                    apply_key_with_profile(&previous, plan, CipherProfile::Previous)?;
+                    if verify_database(&previous).is_ok() {
+                        previous
                     } else {
-                        return Err(primary_error);
+                        drop(previous);
+                        let legacy = open_engine_connection(plan, flags)?;
+                        apply_key_with_profile(&legacy, plan, CipherProfile::Legacy)?;
+                        if verify_database(&legacy).is_ok() {
+                            legacy
+                        } else {
+                            return Err(primary_error);
+                        }
                     }
                 }
                 Err(error) => return Err(error),
@@ -458,6 +465,7 @@ enum ConnectionOwner {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CipherProfile {
     Current,
+    Previous,
     Legacy,
 }
 
@@ -926,12 +934,16 @@ fn apply_key_with_profile(
     let _profile_guard = CIPHER_PROFILE_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let hmac = match profile {
-        CipherProfile::Current => "HMAC_SHA256",
-        CipherProfile::Legacy => "HMAC_SHA512",
+    let (hmac, page_size) = match profile {
+        CipherProfile::Current => ("HMAC_SHA256", 1_024),
+        CipherProfile::Previous => ("HMAC_SHA256", 4_096),
+        CipherProfile::Legacy => ("HMAC_SHA512", 4_096),
     };
     connection
         .pragma_update(None, "cipher_default_hmac_algorithm", hmac)
+        .map_err(|error| map_storage_error(&error))?;
+    connection
+        .pragma_update(None, "cipher_default_page_size", page_size)
         .map_err(|error| map_storage_error(&error))?;
     plan.with_key(|key| apply_key(connection, key))
 }
@@ -1130,6 +1142,11 @@ mod tests {
 
     static NEXT_DATABASE: AtomicU64 = AtomicU64::new(1);
 
+    unsafe extern "C" {
+        fn _csgdb_internal_hmac_self_test() -> c_int;
+        fn _csgdb_internal_hmac_legacy_self_test() -> c_int;
+    }
+
     struct TestDatabasePath(PathBuf);
 
     impl TestDatabasePath {
@@ -1167,6 +1184,20 @@ mod tests {
     }
 
     #[test]
+    fn optimized_hmac_matches_the_rfc_sha256_vector() {
+        // SAFETY: the linked helper takes no pointers and only operates on
+        // fixed test vectors in its own stack storage.
+        assert_eq!(unsafe { _csgdb_internal_hmac_self_test() }, 1);
+    }
+
+    #[test]
+    fn optimized_hmac_matches_the_sha1_and_sha512_vectors() {
+        // SAFETY: the linked helper takes no pointers and only operates on
+        // fixed test vectors in its own stack storage.
+        assert_eq!(unsafe { _csgdb_internal_hmac_legacy_self_test() }, 1);
+    }
+
+    #[test]
     fn new_encrypted_databases_use_the_current_authenticated_profile() {
         let path = TestDatabasePath::new("current-cipher-profile");
         let plan = encrypted_plan(path.path());
@@ -1176,6 +1207,45 @@ mod tests {
             .query_row("PRAGMA cipher_hmac_algorithm", [], |row| row.get(0))
             .expect("read cipher profile");
         assert_eq!(profile, "HMAC_SHA256");
+        assert_eq!(
+            connection
+                .inner
+                .query_row("PRAGMA cipher_page_size", [], |row| row.get::<_, String>(0))
+                .expect("read encrypted page size"),
+            "1024"
+        );
+    }
+
+    #[test]
+    fn previous_sha256_page_profile_reopens_automatically() {
+        let path = TestDatabasePath::new("previous-cipher-profile");
+        let plan = encrypted_plan(path.path());
+        let flags = sqlite_open_flags(plan.flags());
+        let previous = open_engine_connection(&plan, flags).expect("open previous database");
+        apply_key_with_profile(&previous, &plan, CipherProfile::Previous)
+            .expect("apply previous key");
+        verify_database(&previous).expect("initialize previous database");
+        previous
+            .execute_batch(
+                "CREATE TABLE previous(value INTEGER NOT NULL); INSERT INTO previous VALUES (43);",
+            )
+            .expect("write previous database");
+        drop(previous);
+
+        let connection = Connection::open(&plan).expect("auto-detect previous profile");
+        assert_eq!(
+            connection
+                .query_i64("SELECT value FROM previous")
+                .expect("read previous database"),
+            43
+        );
+        assert_eq!(
+            connection
+                .inner
+                .query_row("PRAGMA cipher_page_size", [], |row| row.get::<_, String>(0))
+                .expect("read previous page size"),
+            "4096"
+        );
     }
 
     #[test]

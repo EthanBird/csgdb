@@ -539,7 +539,7 @@ mod tests {
     }
 
     #[test]
-    fn bundled_kernel_uses_pool_safe_threading_without_global_memstatus() {
+    fn bundled_kernel_uses_connection_local_page_caches_without_global_stats() {
         let path = TestDatabasePath::new("kernel-build-policy");
         let database = Database::open_plaintext(path.path()).expect("open plaintext database");
         assert_eq!(
@@ -552,6 +552,24 @@ mod tests {
             database
                 .query_i64("SELECT sqlite_compileoption_used('DEFAULT_MEMSTATUS=0')")
                 .expect("read memory status mode"),
+            1
+        );
+        assert_eq!(
+            database
+                .query_i64("SELECT sqlite_compileoption_used('ENABLE_MEMORY_MANAGEMENT')")
+                .expect("read page-cache management mode"),
+            0
+        );
+        assert_eq!(
+            database
+                .query_i64("SELECT sqlite_compileoption_used('ENABLE_API_ARMOR')")
+                .expect("read API armor mode"),
+            0
+        );
+        assert_eq!(
+            database
+                .query_i64("SELECT sqlite_compileoption_used('DISABLE_PAGECACHE_OVERFLOW_STATS')",)
+                .expect("read page-cache statistics mode"),
             1
         );
     }

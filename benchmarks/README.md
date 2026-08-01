@@ -57,5 +57,7 @@ The first published baseline and its raw repetitions are in:
 - [`benchmarks/results/2026-08-01-x86_64.json`](results/2026-08-01-x86_64.json)
 - [`docs/performance-optimization-2026-08-01.md`](../docs/performance-optimization-2026-08-01.md)
 - [`benchmarks/results/2026-08-01-performance-optimization.json`](results/2026-08-01-performance-optimization.json)
+- [`docs/performance-optimization-round2-2026-08-01.md`](../docs/performance-optimization-round2-2026-08-01.md)
+- [`benchmarks/results/2026-08-01-performance-optimization-round2.json`](results/2026-08-01-performance-optimization-round2.json)
 
 The fixed key is test material only. It must never be reused by an application.
