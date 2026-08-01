@@ -65,7 +65,13 @@ extern const char *sqlite3_libversion(void);
 #define WRITE_BATCH 32
 #define READER_SAMPLE_CAPACITY 262144
 #define WRITER_SAMPLE_CAPACITY 65536
-#define CACHE_SIZE_BYTES (4ULL * 1024ULL * 1024ULL)
+#ifndef CSGDB_BENCH_CACHE_SIZE_BYTES
+#define CSGDB_BENCH_CACHE_SIZE_BYTES (4ULL * 1024ULL * 1024ULL)
+#endif
+#define CACHE_SIZE_BYTES CSGDB_BENCH_CACHE_SIZE_BYTES
+#ifndef CSGDB_BENCH_MUTEX_FLAG
+#define CSGDB_BENCH_MUTEX_FLAG CSGDB_OPEN_FULLMUTEX
+#endif
 
 typedef enum engine_kind {
     ENGINE_SQLITE,
@@ -190,9 +196,19 @@ static int database_open(database_handle *database, engine_kind engine, const ch
             result = sqlite3_busy_timeout(database->sqlite, 5000);
         }
         if (result == SQLITE_OK_LOCAL) {
+            char cache_pragma[64];
+            int written = snprintf(
+                cache_pragma,
+                sizeof(cache_pragma),
+                "PRAGMA cache_size=-%llu",
+                (unsigned long long)(CACHE_SIZE_BYTES / 1024ULL)
+            );
+            if (written <= 0 || (size_t)written >= sizeof(cache_pragma)) {
+                return 1;
+            }
             result = sqlite3_exec(
                 database->sqlite,
-                "PRAGMA cache_size=-4096",
+                cache_pragma,
                 NULL,
                 NULL,
                 NULL
@@ -208,10 +224,10 @@ static int database_open(database_handle *database, engine_kind engine, const ch
     options.cache_size_bytes = CACHE_SIZE_BYTES;
     if (engine == ENGINE_CSGDB_PLAINTEXT) {
         options.flags = CSGDB_OPEN_READWRITE | CSGDB_OPEN_CREATE |
-            CSGDB_OPEN_PLAINTEXT | CSGDB_OPEN_FULLMUTEX;
+            CSGDB_OPEN_PLAINTEXT | CSGDB_BENCH_MUTEX_FLAG;
     } else {
         options.flags = CSGDB_OPEN_READWRITE | CSGDB_OPEN_CREATE |
-            CSGDB_OPEN_ENCRYPTED | CSGDB_OPEN_FULLMUTEX;
+            CSGDB_OPEN_ENCRYPTED | CSGDB_BENCH_MUTEX_FLAG;
         options.key.kind = CSGDB_KEY_RAW;
         options.key.data = DATABASE_KEY;
         options.key.data_len = sizeof(DATABASE_KEY);

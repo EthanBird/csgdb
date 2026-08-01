@@ -149,6 +149,19 @@ impl Database {
         Ok(Self { connection })
     }
 
+    fn open_resolved_single_owner(
+        plan: &ResolvedOpenPlan,
+        readonly: bool,
+        cache_size_bytes: u64,
+    ) -> Result<Self> {
+        let connection = if readonly {
+            csgdb_storage::Connection::open_readonly_single_owner(plan, cache_size_bytes)?
+        } else {
+            csgdb_storage::Connection::open_single_owner(plan, cache_size_bytes)?
+        };
+        Ok(Self { connection })
+    }
+
     #[must_use]
     pub fn builder(path: impl AsRef<Path>) -> DatabaseBuilder {
         DatabaseBuilder::new(path)
@@ -523,6 +536,24 @@ mod tests {
         let mut header = [0_u8; 16];
         file.read_exact(&mut header).expect("database header");
         assert_eq!(&header, csgdb_storage::plaintext_header());
+    }
+
+    #[test]
+    fn bundled_kernel_uses_pool_safe_threading_without_global_memstatus() {
+        let path = TestDatabasePath::new("kernel-build-policy");
+        let database = Database::open_plaintext(path.path()).expect("open plaintext database");
+        assert_eq!(
+            database
+                .query_i64("SELECT sqlite_compileoption_used('THREADSAFE=2')")
+                .expect("read thread mode"),
+            1
+        );
+        assert_eq!(
+            database
+                .query_i64("SELECT sqlite_compileoption_used('DEFAULT_MEMSTATUS=0')")
+                .expect("read memory status mode"),
+            1
+        );
     }
 
     #[test]

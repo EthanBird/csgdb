@@ -13,12 +13,14 @@ use rusqlite::{
 };
 use std::ffi::{c_int, c_void, CString};
 use std::ptr;
+use std::sync::Mutex;
 use std::time::Duration;
 
 const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
 const MAX_BUSY_TIMEOUT_MILLIS: u128 = 2_147_483_647;
 pub const DEFAULT_PREPARED_STATEMENT_CACHE_CAPACITY: usize = 16;
 pub const MAX_WAL_AUTOCHECKPOINT_FRAMES: u32 = i32::MAX as u32;
+static CIPHER_PROFILE_LOCK: Mutex<()> = Mutex::new(());
 
 /// A live storage-kernel connection.
 pub struct Connection {
@@ -34,7 +36,30 @@ impl Connection {
     /// Returns an error when the database cannot be opened, keying fails, the
     /// key is incorrect, or connection initialization cannot complete.
     pub fn open(plan: &ResolvedOpenPlan) -> Result<Self> {
-        Self::open_with_access(plan, ConnectionAccess::ReadWrite)
+        Self::open_with_access(
+            plan,
+            ConnectionAccess::ReadWrite,
+            ConnectionOwner::Shared,
+            plan.cache_size_bytes(),
+        )
+    }
+
+    /// Opens a connection handed to one owner at a time.
+    ///
+    /// This is intended for connection managers whose checkout and writer
+    /// scheduling already serialize access. It removes redundant engine
+    /// connection mutexes while retaining cross-connection thread safety.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when opening or initializing the connection fails.
+    pub fn open_single_owner(plan: &ResolvedOpenPlan, cache_size_bytes: u64) -> Result<Self> {
+        Self::open_with_access(
+            plan,
+            ConnectionAccess::ReadWrite,
+            ConnectionOwner::Single,
+            cache_size_bytes,
+        )
     }
 
     /// Opens a validated plan as a read-only connection.
@@ -47,31 +72,74 @@ impl Connection {
     /// Returns an error when the database cannot be opened read-only, keying
     /// fails, the key is incorrect, or initialization cannot complete.
     pub fn open_readonly(plan: &ResolvedOpenPlan) -> Result<Self> {
-        Self::open_with_access(plan, ConnectionAccess::ReadOnly)
+        Self::open_with_access(
+            plan,
+            ConnectionAccess::ReadOnly,
+            ConnectionOwner::Shared,
+            plan.cache_size_bytes(),
+        )
     }
 
-    fn open_with_access(plan: &ResolvedOpenPlan, access: ConnectionAccess) -> Result<Self> {
-        let flags = match access {
+    /// Opens a read-only connection checked out to one owner at a time.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when opening or initializing the connection fails.
+    pub fn open_readonly_single_owner(
+        plan: &ResolvedOpenPlan,
+        cache_size_bytes: u64,
+    ) -> Result<Self> {
+        Self::open_with_access(
+            plan,
+            ConnectionAccess::ReadOnly,
+            ConnectionOwner::Single,
+            cache_size_bytes,
+        )
+    }
+
+    fn open_with_access(
+        plan: &ResolvedOpenPlan,
+        access: ConnectionAccess,
+        owner: ConnectionOwner,
+        cache_size_bytes: u64,
+    ) -> Result<Self> {
+        let mut flags = match access {
             ConnectionAccess::ReadWrite => plan.flags(),
             ConnectionAccess::ReadOnly => readonly_open_flags(plan.flags()),
         };
+        if owner == ConnectionOwner::Single {
+            flags = single_owner_open_flags(flags);
+        }
         let flags = sqlite_open_flags(flags);
-        let inner = if let Some(vfs) = plan.vfs() {
-            SqlConnection::open_with_flags_and_vfs(plan.path(), flags, vfs)
+        let legacy_candidate = plan
+            .path()
+            .metadata()
+            .is_ok_and(|metadata| metadata.len() > 0);
+        let inner = open_engine_connection(plan, flags)?;
+        let inner = if plan.security() == SecurityMode::Encrypted {
+            apply_key_with_profile(&inner, plan, CipherProfile::Current)?;
+            match verify_database(&inner) {
+                Ok(()) => inner,
+                Err(primary_error) if legacy_candidate => {
+                    drop(inner);
+                    let legacy = open_engine_connection(plan, flags)?;
+                    apply_key_with_profile(&legacy, plan, CipherProfile::Legacy)?;
+                    if verify_database(&legacy).is_ok() {
+                        legacy
+                    } else {
+                        return Err(primary_error);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
         } else {
-            SqlConnection::open_with_flags(plan.path(), flags)
-        }
-        .map_err(|error| map_open_error(&error))?;
-
-        if plan.security() == SecurityMode::Encrypted {
-            plan.with_key(|key| apply_key(&inner, key))?;
-        }
-
-        verify_database(&inner)?;
+            verify_database(&inner)?;
+            inner
+        };
         inner
             .busy_timeout(plan.busy_timeout())
             .map_err(|error| map_storage_error(&error))?;
-        configure_connection(&inner, plan, access)?;
+        configure_connection(&inner, plan, access, cache_size_bytes)?;
         inner.set_prepared_statement_cache_capacity(DEFAULT_PREPARED_STATEMENT_CACHE_CAPACITY);
 
         Ok(Self {
@@ -379,6 +447,18 @@ impl Connection {
 enum ConnectionAccess {
     ReadOnly,
     ReadWrite,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConnectionOwner {
+    Shared,
+    Single,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CipherProfile {
+    Current,
+    Legacy,
 }
 
 /// A transaction that rolls back automatically unless committed.
@@ -824,6 +904,38 @@ fn readonly_open_flags(flags: CoreOpenFlags) -> CoreOpenFlags {
     readonly
 }
 
+fn single_owner_open_flags(flags: CoreOpenFlags) -> CoreOpenFlags {
+    let bits = (flags.bits() & !CoreOpenFlags::FULLMUTEX.bits()) | CoreOpenFlags::NOMUTEX.bits();
+    CoreOpenFlags::from_bits(bits).expect("known open flags remain valid")
+}
+
+fn open_engine_connection(plan: &ResolvedOpenPlan, flags: SqlOpenFlags) -> Result<SqlConnection> {
+    if let Some(vfs) = plan.vfs() {
+        SqlConnection::open_with_flags_and_vfs(plan.path(), flags, vfs)
+    } else {
+        SqlConnection::open_with_flags(plan.path(), flags)
+    }
+    .map_err(|error| map_open_error(&error))
+}
+
+fn apply_key_with_profile(
+    connection: &SqlConnection,
+    plan: &ResolvedOpenPlan,
+    profile: CipherProfile,
+) -> Result<()> {
+    let _profile_guard = CIPHER_PROFILE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let hmac = match profile {
+        CipherProfile::Current => "HMAC_SHA256",
+        CipherProfile::Legacy => "HMAC_SHA512",
+    };
+    connection
+        .pragma_update(None, "cipher_default_hmac_algorithm", hmac)
+        .map_err(|error| map_storage_error(&error))?;
+    plan.with_key(|key| apply_key(connection, key))
+}
+
 fn apply_key(connection: &SqlConnection, key: Option<ResolvedKeyRef<'_>>) -> Result<()> {
     let key = key.ok_or_else(|| {
         Error::new(
@@ -886,12 +998,13 @@ fn configure_connection(
     connection: &SqlConnection,
     plan: &ResolvedOpenPlan,
     access: ConnectionAccess,
+    cache_size_bytes: u64,
 ) -> Result<()> {
     connection
         .pragma_update(None, "foreign_keys", true)
         .map_err(|error| map_storage_error(&error))?;
 
-    let cache_kib = plan.cache_size_bytes().div_ceil(1024);
+    let cache_kib = cache_size_bytes.div_ceil(1024);
     let cache_kib = i64::try_from(cache_kib)
         .unwrap_or(i64::MAX)
         .saturating_neg();
@@ -1005,4 +1118,92 @@ fn non_negative_frame_count(value: c_int) -> Option<u32> {
 #[must_use]
 pub const fn plaintext_header() -> &'static [u8; 16] {
     SQLITE_HEADER
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use csgdb_core::{prepare_open, KeySource, OpenOptions, SecretKey};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_DATABASE: AtomicU64 = AtomicU64::new(1);
+
+    struct TestDatabasePath(PathBuf);
+
+    impl TestDatabasePath {
+        fn new(name: &str) -> Self {
+            let sequence = NEXT_DATABASE.fetch_add(1, Ordering::Relaxed);
+            Self(std::env::temp_dir().join(format!(
+                "csgdb-storage-{name}-{}-{sequence}.db",
+                std::process::id()
+            )))
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDatabasePath {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+            let base = self.0.to_string_lossy();
+            let _ = fs::remove_file(format!("{base}-wal"));
+            let _ = fs::remove_file(format!("{base}-shm"));
+        }
+    }
+
+    fn encrypted_plan(path: &Path) -> ResolvedOpenPlan {
+        let options = OpenOptions {
+            key: KeySource::Raw(SecretKey::from_slice(&[23_u8; 32]).expect("fixed key")),
+            ..OpenOptions::default()
+        };
+        prepare_open(path, options)
+            .expect("prepare encrypted open")
+            .resolve_key()
+            .expect("resolve key")
+    }
+
+    #[test]
+    fn new_encrypted_databases_use_the_current_authenticated_profile() {
+        let path = TestDatabasePath::new("current-cipher-profile");
+        let plan = encrypted_plan(path.path());
+        let connection = Connection::open(&plan).expect("open encrypted database");
+        let profile: String = connection
+            .inner
+            .query_row("PRAGMA cipher_hmac_algorithm", [], |row| row.get(0))
+            .expect("read cipher profile");
+        assert_eq!(profile, "HMAC_SHA256");
+    }
+
+    #[test]
+    fn legacy_authenticated_profile_reopens_automatically() {
+        let path = TestDatabasePath::new("legacy-cipher-profile");
+        let plan = encrypted_plan(path.path());
+        let flags = sqlite_open_flags(plan.flags());
+        let legacy = open_engine_connection(&plan, flags).expect("open raw legacy database");
+        apply_key_with_profile(&legacy, &plan, CipherProfile::Legacy).expect("apply legacy key");
+        verify_database(&legacy).expect("initialize legacy database");
+        legacy
+            .execute_batch(
+                "CREATE TABLE legacy(value INTEGER NOT NULL); INSERT INTO legacy VALUES (41);",
+            )
+            .expect("write legacy database");
+        drop(legacy);
+
+        let connection = Connection::open(&plan).expect("auto-detect legacy profile");
+        assert_eq!(
+            connection
+                .query_i64("SELECT value FROM legacy")
+                .expect("read legacy database"),
+            41
+        );
+        let profile: String = connection
+            .inner
+            .query_row("PRAGMA cipher_hmac_algorithm", [], |row| row.get(0))
+            .expect("read legacy profile");
+        assert_eq!(profile, "HMAC_SHA512");
+    }
 }

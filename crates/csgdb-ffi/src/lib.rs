@@ -11,7 +11,7 @@ use libsqlite3_sys as sqlite;
 use std::ffi::{c_char, c_void, CStr};
 use std::os::raw::c_int;
 use std::ptr;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -123,6 +123,9 @@ impl Default for csgdb_open_options {
     }
 }
 
+// Connection wrappers are independently hot on concurrent worker threads.
+// Keep their lock and status word off neighboring wrappers' cache lines.
+#[repr(align(64))]
 struct SharedDatabase {
     database: Mutex<Database>,
     interrupt: InterruptHandle,
@@ -146,7 +149,11 @@ impl SharedDatabase {
     }
 
     fn set_ok(&self) {
-        self.last_code.store(CSGDB_OK, Ordering::Release);
+        // Successful statement calls dominate normal workloads. Avoid making
+        // the per-connection status cache line dirty when it is already OK.
+        if self.last_code.load(Ordering::Relaxed) != CSGDB_OK {
+            self.last_code.store(CSGDB_OK, Ordering::Release);
+        }
     }
 
     fn set_code(&self, code: i32) -> i32 {
@@ -176,6 +183,7 @@ impl CsgdbHandle {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
 enum StatementState {
     Ready,
     Row,
@@ -183,39 +191,34 @@ enum StatementState {
     Failed,
 }
 
-struct StatementInner {
-    raw: *mut sqlite::sqlite3_stmt,
-    state: StatementState,
-}
-
-// SAFETY: a statement is never accessed without both its own mutex and its
-// owning connection mutex. `SharedDatabase` keeps the connection alive until
-// the statement is finalized.
-unsafe impl Send for StatementInner {}
-
+// Prepared statements are normally thread-confined but are allocated in
+// batches for connection pools. Alignment prevents their state writes
+// from invalidating a neighboring worker's statement cache line.
+#[repr(align(64))]
 pub struct CsgdbStatement {
     database: Arc<SharedDatabase>,
-    inner: Mutex<StatementInner>,
+    raw: *mut sqlite::sqlite3_stmt,
+    state: AtomicU8,
+    parameter_count: c_int,
+    column_count: c_int,
 }
+
+// SAFETY: the raw engine statement remains alive until the C handle is
+// finalized. Its state word is atomic, and the default FULLMUTEX connection
+// serializes engine calls. NOMUTEX callers explicitly assume responsibility
+// for keeping a connection and all of its statements on one thread at a time.
+unsafe impl Send for CsgdbStatement {}
+unsafe impl Sync for CsgdbStatement {}
 
 impl Drop for CsgdbStatement {
     fn drop(&mut self) {
-        let _database = self
-            .database
-            .database
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let inner = self
-            .inner
-            .get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !inner.raw.is_null() {
+        if !self.raw.is_null() {
             // SAFETY: this type uniquely owns the raw statement. Drop runs
             // only after public access has ended and finalizes at most once.
             unsafe {
-                sqlite::sqlite3_finalize(inner.raw);
+                sqlite::sqlite3_finalize(self.raw);
             }
-            inner.raw = ptr::null_mut();
+            self.raw = ptr::null_mut();
         }
     }
 }
@@ -853,10 +856,8 @@ pub unsafe extern "C" fn csgdb_bind_parameter_count(statement: *const CsgdbState
     let Some(statement) = (unsafe { statement.as_ref() }) else {
         return 0;
     };
-    with_statement_metadata(statement, 0, |raw| {
-        // SAFETY: the statement lock keeps `raw` live.
-        unsafe { sqlite::sqlite3_bind_parameter_count(raw) }
-    })
+    statement.database.set_ok();
+    statement.parameter_count
 }
 
 /// Returns the one-based index of a named parameter, or zero when absent.
@@ -1088,31 +1089,35 @@ pub unsafe extern "C" fn csgdb_step(statement: *mut CsgdbStatement) -> i32 {
     let Some(statement) = (unsafe { statement.as_ref() }) else {
         return CSGDB_INVALID_ARGUMENT;
     };
-    let Ok(_database) = statement.database.database.lock() else {
-        return statement.database.set_code(CSGDB_STORAGE);
-    };
-    let Ok(mut inner) = statement.inner.lock() else {
-        return statement.database.set_code(CSGDB_STORAGE);
-    };
-    if matches!(inner.state, StatementState::Done | StatementState::Failed) {
+    let state = statement.state.load(Ordering::Relaxed);
+    if matches!(
+        state,
+        value if value == StatementState::Done as u8 || value == StatementState::Failed as u8
+    ) {
         return statement.database.set_code(CSGDB_MISUSE);
     }
-    // SAFETY: both locks keep the statement and owning connection live and
-    // serialize this raw engine call.
-    let result = unsafe { sqlite::sqlite3_step(inner.raw) };
+    // SAFETY: the caller keeps the statement live. Engine synchronization is
+    // provided by the default FULLMUTEX mode or by a NOMUTEX caller.
+    let result = unsafe { sqlite::sqlite3_step(statement.raw) };
     match result {
         sqlite::SQLITE_ROW => {
-            inner.state = StatementState::Row;
+            statement
+                .state
+                .store(StatementState::Row as u8, Ordering::Relaxed);
             statement.database.set_ok();
             CSGDB_ROW
         }
         sqlite::SQLITE_DONE => {
-            inner.state = StatementState::Done;
+            statement
+                .state
+                .store(StatementState::Done as u8, Ordering::Relaxed);
             statement.database.set_ok();
             CSGDB_DONE
         }
         _ => {
-            inner.state = StatementState::Failed;
+            statement
+                .state
+                .store(StatementState::Failed as u8, Ordering::Relaxed);
             statement.database.set_code(map_sqlite_code(result))
         }
     }
@@ -1129,15 +1134,12 @@ pub unsafe extern "C" fn csgdb_reset(statement: *mut CsgdbStatement) -> i32 {
     let Some(statement) = (unsafe { statement.as_ref() }) else {
         return CSGDB_INVALID_ARGUMENT;
     };
-    let Ok(_database) = statement.database.database.lock() else {
-        return statement.database.set_code(CSGDB_STORAGE);
-    };
-    let Ok(mut inner) = statement.inner.lock() else {
-        return statement.database.set_code(CSGDB_STORAGE);
-    };
-    // SAFETY: both locks keep the raw statement live and serialize the call.
-    let result = unsafe { sqlite::sqlite3_reset(inner.raw) };
-    inner.state = StatementState::Ready;
+    // SAFETY: the caller keeps the raw statement live. Connection-level
+    // synchronization follows the selected mutex mode.
+    let result = unsafe { sqlite::sqlite3_reset(statement.raw) };
+    statement
+        .state
+        .store(StatementState::Ready as u8, Ordering::Relaxed);
     set_sqlite_result(&statement.database, result)
 }
 
@@ -1169,10 +1171,8 @@ pub unsafe extern "C" fn csgdb_column_count(statement: *const CsgdbStatement) ->
     let Some(statement) = (unsafe { statement.as_ref() }) else {
         return 0;
     };
-    with_statement_metadata(statement, 0, |raw| {
-        // SAFETY: the statement lock keeps `raw` live.
-        unsafe { sqlite::sqlite3_column_count(raw) }
-    })
+    statement.database.set_ok();
+    statement.column_count
 }
 
 /// Returns a result-column name. The pointer remains valid until finalization.
@@ -1342,16 +1342,10 @@ pub unsafe extern "C" fn csgdb_finalize(statement: *mut CsgdbStatement) -> i32 {
         return CSGDB_OK;
     }
     // SAFETY: ownership of a live statement is transferred exactly once.
-    let boxed = unsafe { Box::from_raw(statement) };
-    let Ok(_database) = boxed.database.database.lock() else {
-        return boxed.database.set_code(CSGDB_STORAGE);
-    };
-    let Ok(mut inner) = boxed.inner.lock() else {
-        return boxed.database.set_code(CSGDB_STORAGE);
-    };
-    let raw = std::mem::replace(&mut inner.raw, ptr::null_mut());
-    // SAFETY: `raw` was created by prepare, remains live under both locks, and
-    // is finalized exactly once.
+    let mut boxed = unsafe { Box::from_raw(statement) };
+    let raw = std::mem::replace(&mut boxed.raw, ptr::null_mut());
+    // SAFETY: `raw` was created by prepare and is finalized exactly once. The
+    // C API contract excludes racing finalization with another statement call.
     let result = unsafe { sqlite::sqlite3_finalize(raw) };
     set_sqlite_result(&boxed.database, result)
 }
@@ -1477,12 +1471,18 @@ unsafe fn prepare_statement(
     }
 
     if !raw_statement.is_null() {
+        // SAFETY: prepare succeeded and the connection lock keeps the raw
+        // statement alive while immutable metadata is captured.
+        let parameter_count = unsafe { sqlite::sqlite3_bind_parameter_count(raw_statement) };
+        // SAFETY: same as above. The result-column count is fixed for the
+        // lifetime of a prepared statement.
+        let column_count = unsafe { sqlite::sqlite3_column_count(raw_statement) };
         let statement = Box::new(CsgdbStatement {
             database: Arc::clone(shared),
-            inner: Mutex::new(StatementInner {
-                raw: raw_statement,
-                state: StatementState::Ready,
-            }),
+            raw: raw_statement,
+            state: AtomicU8::new(StatementState::Ready as u8),
+            parameter_count,
+            column_count,
         });
         // SAFETY: the caller guarantees writable output storage.
         unsafe {
@@ -1498,17 +1498,15 @@ fn bind_value(
     index: c_int,
     operation: impl FnOnce(*mut sqlite::sqlite3_stmt) -> c_int,
 ) -> i32 {
-    if index <= 0 {
+    if index <= 0 || index > statement.parameter_count {
         return statement.database.set_code(CSGDB_RANGE);
     }
-    let parameter_count = with_statement_metadata(statement, 0, |raw| {
-        // SAFETY: the helper locks keep `raw` live.
-        unsafe { sqlite::sqlite3_bind_parameter_count(raw) }
-    });
-    if index > parameter_count {
-        return statement.database.set_code(CSGDB_RANGE);
+    if statement.state.load(Ordering::Relaxed) != StatementState::Ready as u8
+        || statement.raw.is_null()
+    {
+        return statement.database.set_code(CSGDB_MISUSE);
     }
-    statement_ready_operation(statement, operation)
+    set_sqlite_result(&statement.database, operation(statement.raw))
 }
 
 fn with_database_value<T>(
@@ -1532,16 +1530,12 @@ fn statement_ready_operation(
     statement: &CsgdbStatement,
     operation: impl FnOnce(*mut sqlite::sqlite3_stmt) -> c_int,
 ) -> i32 {
-    let Ok(_database) = statement.database.database.lock() else {
-        return statement.database.set_code(CSGDB_STORAGE);
-    };
-    let Ok(inner) = statement.inner.lock() else {
-        return statement.database.set_code(CSGDB_STORAGE);
-    };
-    if inner.state != StatementState::Ready || inner.raw.is_null() {
+    if statement.state.load(Ordering::Relaxed) != StatementState::Ready as u8
+        || statement.raw.is_null()
+    {
         return statement.database.set_code(CSGDB_MISUSE);
     }
-    set_sqlite_result(&statement.database, operation(inner.raw))
+    set_sqlite_result(&statement.database, operation(statement.raw))
 }
 
 fn with_statement_metadata<T>(
@@ -1549,19 +1543,11 @@ fn with_statement_metadata<T>(
     default: T,
     operation: impl FnOnce(*mut sqlite::sqlite3_stmt) -> T,
 ) -> T {
-    let Ok(_database) = statement.database.database.lock() else {
-        statement.database.set_code(CSGDB_STORAGE);
-        return default;
-    };
-    let Ok(inner) = statement.inner.lock() else {
-        statement.database.set_code(CSGDB_STORAGE);
-        return default;
-    };
-    if inner.raw.is_null() {
+    if statement.raw.is_null() {
         statement.database.set_code(CSGDB_MISUSE);
         return default;
     }
-    let value = operation(inner.raw);
+    let value = operation(statement.raw);
     statement.database.set_ok();
     value
 }
@@ -1572,25 +1558,15 @@ fn with_column_metadata<T>(
     default: T,
     operation: impl FnOnce(*mut sqlite::sqlite3_stmt) -> T,
 ) -> T {
-    let Ok(_database) = statement.database.database.lock() else {
-        statement.database.set_code(CSGDB_STORAGE);
-        return default;
-    };
-    let Ok(inner) = statement.inner.lock() else {
-        statement.database.set_code(CSGDB_STORAGE);
-        return default;
-    };
-    if inner.raw.is_null() {
+    if statement.raw.is_null() {
         statement.database.set_code(CSGDB_MISUSE);
         return default;
     }
-    // SAFETY: both locks keep `inner.raw` live.
-    let count = unsafe { sqlite::sqlite3_column_count(inner.raw) };
-    if index < 0 || index >= count {
+    if index < 0 || index >= statement.column_count {
         statement.database.set_code(CSGDB_RANGE);
         return default;
     }
-    let value = operation(inner.raw);
+    let value = operation(statement.raw);
     statement.database.set_ok();
     value
 }
@@ -1601,25 +1577,17 @@ fn with_row_column<T>(
     default: T,
     operation: impl FnOnce(*mut sqlite::sqlite3_stmt) -> T,
 ) -> T {
-    let Ok(_database) = statement.database.database.lock() else {
-        statement.database.set_code(CSGDB_STORAGE);
-        return default;
-    };
-    let Ok(inner) = statement.inner.lock() else {
-        statement.database.set_code(CSGDB_STORAGE);
-        return default;
-    };
-    if inner.raw.is_null() || inner.state != StatementState::Row {
+    if statement.raw.is_null()
+        || statement.state.load(Ordering::Relaxed) != StatementState::Row as u8
+    {
         statement.database.set_code(CSGDB_MISUSE);
         return default;
     }
-    // SAFETY: both locks keep `inner.raw` live.
-    let count = unsafe { sqlite::sqlite3_column_count(inner.raw) };
-    if index < 0 || index >= count {
+    if index < 0 || index >= statement.column_count {
         statement.database.set_code(CSGDB_RANGE);
         return default;
     }
-    let value = operation(inner.raw);
+    let value = operation(statement.raw);
     statement.database.set_ok();
     value
 }
@@ -1917,6 +1885,63 @@ mod tests {
             unsafe { csgdb_open_v3(c_path.as_ptr(), &raw mut database, &raw const options) };
         assert_eq!(result, CSGDB_OK);
         assert_eq!(unsafe { csgdb_close(database) }, CSGDB_OK);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn fullmutex_connection_runs_independent_statements_in_parallel() {
+        let (path, c_path) = test_path("parallel-statements");
+        let flags = (OpenFlags::READWRITE
+            | OpenFlags::CREATE
+            | OpenFlags::PLAINTEXT
+            | OpenFlags::FULLMUTEX)
+            .bits();
+        let mut database = ptr::null_mut();
+        assert_eq!(
+            unsafe { csgdb_open_v2(c_path.as_ptr(), &raw mut database, flags, ptr::null(),) },
+            CSGDB_OK
+        );
+
+        let sql = c"SELECT ?1 + 1";
+        let mut statements = [ptr::null_mut(); 2];
+        for statement in &mut statements {
+            assert_eq!(
+                unsafe {
+                    csgdb_prepare_v3(
+                        database,
+                        sql.as_ptr(),
+                        -1,
+                        CSGDB_PREPARE_PERSISTENT,
+                        statement,
+                        ptr::null_mut(),
+                    )
+                },
+                CSGDB_OK
+            );
+        }
+
+        // Statement handles retain the shared connection after the public
+        // database handle is closed.
+        assert_eq!(unsafe { csgdb_close(database) }, CSGDB_OK);
+        let workers = statements.map(|statement| {
+            let statement_address = statement as usize;
+            std::thread::spawn(move || {
+                let statement = statement_address as *mut CsgdbStatement;
+                for value in 0..5_000 {
+                    assert_eq!(unsafe { csgdb_bind_int(statement, 1, value) }, CSGDB_OK);
+                    assert_eq!(unsafe { csgdb_step(statement) }, CSGDB_ROW);
+                    assert_eq!(unsafe { csgdb_column_int(statement, 0) }, value + 1);
+                    assert_eq!(unsafe { csgdb_step(statement) }, CSGDB_DONE);
+                    assert_eq!(unsafe { csgdb_reset(statement) }, CSGDB_OK);
+                    assert_eq!(unsafe { csgdb_clear_bindings(statement) }, CSGDB_OK);
+                }
+                statement_address
+            })
+        });
+        for worker in workers {
+            let statement = worker.join().expect("statement worker") as *mut CsgdbStatement;
+            assert_eq!(unsafe { csgdb_finalize(statement) }, CSGDB_OK);
+        }
         remove_database(&path);
     }
 

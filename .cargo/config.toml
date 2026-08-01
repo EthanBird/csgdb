@@ -1,0 +1,7 @@
+[env]
+# The connection manager gives each engine connection one owner at a time, so
+# the bundled kernel only needs multi-thread mode. Global allocation counters
+# are disabled because they serialize otherwise independent connections; the
+# explicit C API still requests FULLMUTEX by default when it needs serialized
+# connection access.
+LIBSQLITE3_FLAGS = { value = "-USQLITE_THREADSAFE SQLITE_THREADSAFE=2 SQLITE_DEFAULT_MEMSTATUS=0 -DEVP_MAC_fetch=_csgdb_internal_evp_mac_fetch", force = true }

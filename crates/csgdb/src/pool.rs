@@ -234,6 +234,7 @@ impl BatchStatement {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct PoolStats {
     pub reader_capacity: usize,
+    pub cache_bytes_per_connection: u64,
     pub available_readers: usize,
     pub active_readers: usize,
     pub rejected_read_checkouts: u64,
@@ -426,15 +427,20 @@ impl DatabasePool {
 
     fn open_resolved(plan: &ResolvedOpenPlan, options: PoolOptions) -> Result<Self> {
         validate_pool_options(plan, options)?;
+        let cache_bytes_per_connection = pool_cache_bytes_per_connection(plan, options)?;
 
-        let writer = Database::open_resolved(plan, false)?;
+        let writer = Database::open_resolved_single_owner(plan, false, cache_bytes_per_connection)?;
         if options.wal_maintenance.enabled {
             writer.set_wal_autocheckpoint(0)?;
         }
         let writer_interrupt = writer.interrupt_handle();
         let mut readers = Vec::with_capacity(options.read_connections);
         for _ in 0..options.read_connections {
-            readers.push(Database::open_resolved(plan, true)?);
+            readers.push(Database::open_resolved_single_owner(
+                plan,
+                true,
+                cache_bytes_per_connection,
+            )?);
         }
 
         let readers = Arc::new(ReadPool::new(readers));
@@ -463,6 +469,7 @@ impl DatabasePool {
                 writer_interrupt,
                 writer_thread: Mutex::new(Some(writer_thread)),
                 security: plan.security(),
+                cache_bytes_per_connection,
             }),
         })
     }
@@ -810,6 +817,7 @@ impl DatabasePool {
         let (available_readers, active_readers) = self.inner.readers.counts();
         PoolStats {
             reader_capacity: self.inner.readers.capacity,
+            cache_bytes_per_connection: self.inner.cache_bytes_per_connection,
             available_readers,
             active_readers,
             rejected_read_checkouts: self
@@ -1026,6 +1034,7 @@ struct PoolInner {
     writer_interrupt: crate::InterruptHandle,
     writer_thread: Mutex<Option<JoinHandle<Result<()>>>>,
     security: SecurityMode,
+    cache_bytes_per_connection: u64,
 }
 
 struct ReadCallbackGuard {
@@ -1694,6 +1703,22 @@ fn validate_pool_options(plan: &ResolvedOpenPlan, options: PoolOptions) -> Resul
     Ok(())
 }
 
+fn pool_cache_bytes_per_connection(plan: &ResolvedOpenPlan, options: PoolOptions) -> Result<u64> {
+    const KIB: u64 = 1024;
+    let connection_count = u64::try_from(options.read_connections)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let budget_share = plan.memory_budget_bytes() / connection_count;
+    let selected = plan.cache_size_bytes().min(budget_share) / KIB * KIB;
+    if selected < KIB {
+        return Err(Error::new(
+            ErrorCode::InvalidPoolConfiguration,
+            "memory budget cannot provide a one KiB page-cache share per connection",
+        ));
+    }
+    Ok(selected)
+}
+
 fn validate_group_commit_options(options: GroupCommitOptions) -> Result<()> {
     if options.max_jobs == 0 || options.max_jobs > MAX_GROUP_COMMIT_JOBS {
         return Err(Error::new(
@@ -1844,6 +1869,10 @@ mod tests {
 
         let stats = pool.stats();
         assert_eq!(stats.reader_capacity, 2);
+        assert_eq!(
+            stats.cache_bytes_per_connection,
+            csgdb_core::DEFAULT_CACHE_SIZE_BYTES
+        );
         assert_eq!(stats.available_readers, 2);
         assert_eq!(stats.active_readers, 0);
         assert_eq!(stats.queued_writes, 0);
@@ -2434,6 +2463,19 @@ mod tests {
         assert_eq!(error.code(), ErrorCode::InvalidPoolConfiguration);
         assert!(!path.path().exists());
 
+        let memory_limited = OpenOptions {
+            key: test_key(47),
+            memory_budget_bytes: 1_024,
+            ..OpenOptions::default()
+        };
+        let error = DatabasePool::builder(path.path())
+            .open_options(memory_limited)
+            .read_connections(2)
+            .open()
+            .expect_err("insufficient per-connection cache budget must fail");
+        assert_eq!(error.code(), ErrorCode::InvalidPoolConfiguration);
+        assert!(!path.path().exists());
+
         let error = DatabasePool::builder(path.path())
             .key(test_key(47))
             .write_queue_capacity(0)
@@ -2476,6 +2518,24 @@ mod tests {
             .expect_err("zero WAL soft limit must fail");
         assert_eq!(error.code(), ErrorCode::InvalidPoolConfiguration);
         assert!(!path.path().exists());
+    }
+
+    #[test]
+    fn pool_divides_page_cache_under_the_total_memory_budget() {
+        let path = TestDatabasePath::new("pool-memory-budget");
+        let open_options = OpenOptions {
+            key: test_key(49),
+            cache_size_bytes: 8 * 1_024 * 1_024,
+            memory_budget_bytes: 10 * 1_024 * 1_024,
+            ..OpenOptions::default()
+        };
+        let pool = DatabasePool::builder(path.path())
+            .open_options(open_options)
+            .read_connections(2)
+            .open()
+            .expect("open memory-bounded pool");
+
+        assert_eq!(pool.stats().cache_bytes_per_connection, 3_494_912);
     }
 
     #[test]

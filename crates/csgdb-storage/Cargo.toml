@@ -15,11 +15,15 @@ fault-injection = []
 
 [dependencies]
 csgdb-core = { path = "../csgdb-core" }
+openssl-sys = "0.9"
 rusqlite = { version = "0.39.0", default-features = false, features = [
     "bundled-sqlcipher-vendored-openssl",
     "cache",
     "modern_sqlite",
 ] }
+
+[build-dependencies]
+cc = "1"
 
 [lints]
 workspace = true

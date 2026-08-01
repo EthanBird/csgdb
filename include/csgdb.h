@@ -65,6 +65,12 @@ extern "C" {
 #define CSGDB_OPEN_NOMUTEX   0x0100u
 #define CSGDB_OPEN_NOFOLLOW  0x0200u
 
+/*
+ * FULLMUTEX is the default and permits serialized access to one connection.
+ * NOMUTEX avoids connection mutexes; the caller must not use the same
+ * connection or its statements concurrently from multiple threads.
+ */
+
 #define CSGDB_KEY_AUTO       0u
 #define CSGDB_KEY_RAW        1u
 #define CSGDB_KEY_PASSPHRASE 2u

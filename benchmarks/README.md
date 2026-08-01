@@ -22,6 +22,14 @@ cc -O3 -DNDEBUG -std=c11 -Wall -Wextra -Werror \
   -o target/sqlite-comparison
 ```
 
+The checked-in comparison uses CSGDB's default `FULLMUTEX` compatibility mode.
+For a controlled single-owner connection experiment, build a second binary
+with `-DCSGDB_BENCH_MUTEX_FLAG=CSGDB_OPEN_NOMUTEX`; each stress worker owns a
+different connection, so this changes only connection-local engine mutexes.
+Use `-DCSGDB_BENCH_CACHE_SIZE_BYTES='(16ULL*1024ULL*1024ULL)'` to build a
+separate cache-curve binary; the selected size is applied symmetrically to
+every system SQLite and CSGDB connection and is reported in JSON output.
+
 Run each engine in a separate process and use a fresh path:
 
 ```bash
@@ -47,5 +55,7 @@ The first published baseline and its raw repetitions are in:
 
 - [`docs/performance-2026-08-01.md`](../docs/performance-2026-08-01.md)
 - [`benchmarks/results/2026-08-01-x86_64.json`](results/2026-08-01-x86_64.json)
+- [`docs/performance-optimization-2026-08-01.md`](../docs/performance-optimization-2026-08-01.md)
+- [`benchmarks/results/2026-08-01-performance-optimization.json`](results/2026-08-01-performance-optimization.json)
 
 The fixed key is test material only. It must never be reused by an application.

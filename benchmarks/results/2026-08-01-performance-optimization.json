@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "date": "2026-08-01",
+  "baseline": "benchmarks/results/2026-08-01-x86_64.json",
+  "environment": {
+    "arch": "x86_64",
+    "system_sqlite": "3.45.1",
+    "csgdb_storage_sqlite": "3.50.4",
+    "filesystem": "ext4",
+    "build": "release",
+    "csgdb_kernel_flags": ["THREADSAFE=2", "DEFAULT_MEMSTATUS=0"],
+    "encryption_profile": "AES-256-CBC+HMAC-SHA256",
+    "openssl_provider_cache": true
+  },
+  "workload": {
+    "rows": 100000,
+    "payload_bytes": 160,
+    "cache_bytes_per_connection": 4194304,
+    "point_reads": 200000,
+    "range_scans": 5000,
+    "updates": 100000,
+    "durable_writes": 1000,
+    "stress_reader_threads": 4,
+    "stress_writer_threads": 1,
+    "stress_rows_per_commit": 32,
+    "stress_seconds": 10
+  },
+  "rounds": [
+    {"round":1,"engine":"sqlite","open_ms":0.263,"bulk_insert_ms":215.990,"durable_autocommit_ms":687.656,"point_read_ms":400.328,"range_scan_ms":343.165,"update_ms":331.766,"stress_seconds":10.000,"stress_reads":7806988,"stress_writes":236608,"stress_commits":7394,"stress_errors":0,"read_p50_us":2.634,"read_p95_us":19.149,"read_p99_us":48.783,"commit_p50_us":772.402,"commit_p95_us":3179.639,"commit_p99_us":15405.956,"database_bytes":20271104,"max_rss_kib":45744},
+    {"round":1,"engine":"csgdb-plaintext","open_ms":5.957,"bulk_insert_ms":193.585,"durable_autocommit_ms":813.597,"point_read_ms":370.829,"range_scan_ms":373.114,"update_ms":324.361,"stress_seconds":10.013,"stress_reads":3392282,"stress_writes":210624,"stress_commits":6582,"stress_errors":0,"read_p50_us":4.958,"read_p95_us":42.043,"read_p99_us":85.508,"commit_p50_us":510.050,"commit_p95_us":12118.615,"commit_p99_us":19397.817,"database_bytes":20275200,"max_rss_kib":57728},
+    {"round":2,"engine":"sqlite","open_ms":0.402,"bulk_insert_ms":295.356,"durable_autocommit_ms":807.854,"point_read_ms":377.722,"range_scan_ms":314.665,"update_ms":339.280,"stress_seconds":10.033,"stress_reads":7864858,"stress_writes":205472,"stress_commits":6421,"stress_errors":0,"read_p50_us":2.554,"read_p95_us":17.607,"read_p99_us":42.073,"commit_p50_us":763.138,"commit_p95_us":3453.728,"commit_p99_us":16975.561,"database_bytes":20271104,"max_rss_kib":46344},
+    {"round":2,"engine":"csgdb-plaintext","open_ms":11.073,"bulk_insert_ms":279.056,"durable_autocommit_ms":823.445,"point_read_ms":377.498,"range_scan_ms":597.506,"update_ms":381.718,"stress_seconds":10.009,"stress_reads":3896098,"stress_writes":184320,"stress_commits":5760,"stress_errors":0,"read_p50_us":3.265,"read_p95_us":29.724,"read_p99_us":63.565,"commit_p50_us":473.596,"commit_p95_us":12448.317,"commit_p99_us":24141.133,"database_bytes":20275200,"max_rss_kib":66492},
+    {"round":3,"engine":"csgdb-plaintext","open_ms":8.480,"bulk_insert_ms":234.824,"durable_autocommit_ms":1140.603,"point_read_ms":450.815,"range_scan_ms":400.104,"update_ms":362.807,"stress_seconds":10.017,"stress_reads":3513083,"stress_writes":209344,"stress_commits":6542,"stress_errors":0,"read_p50_us":4.247,"read_p95_us":47.551,"read_p99_us":97.446,"commit_p50_us":478.744,"commit_p95_us":5456.754,"commit_p99_us":24582.776,"database_bytes":20275200,"max_rss_kib":57580},
+    {"round":3,"engine":"sqlite","open_ms":0.432,"bulk_insert_ms":211.835,"durable_autocommit_ms":715.144,"point_read_ms":407.373,"range_scan_ms":369.561,"update_ms":347.624,"stress_seconds":10.000,"stress_reads":8253442,"stress_writes":192800,"stress_commits":6025,"stress_errors":0,"read_p50_us":2.724,"read_p95_us":20.200,"read_p99_us":44.847,"commit_p50_us":791.800,"commit_p95_us":3083.577,"commit_p99_us":17090.637,"database_bytes":20271104,"max_rss_kib":45828},
+    {"round":1,"engine":"csgdb-encrypted","open_ms":5.471,"bulk_insert_ms":249.414,"durable_autocommit_ms":813.230,"point_read_ms":1184.065,"range_scan_ms":2030.616,"update_ms":1521.301,"stress_seconds":10.001,"stress_reads":2650444,"stress_writes":150944,"stress_commits":4717,"stress_errors":0,"read_p50_us":10.145,"read_p95_us":35.083,"read_p99_us":78.687,"commit_p50_us":978.529,"commit_p95_us":12453.605,"commit_p99_us":26378.573,"database_bytes":20291584,"max_rss_kib":60328},
+    {"round":2,"engine":"csgdb-encrypted","open_ms":3.552,"bulk_insert_ms":243.315,"durable_autocommit_ms":694.545,"point_read_ms":1184.232,"range_scan_ms":2221.128,"update_ms":1573.932,"stress_seconds":10.001,"stress_reads":3006441,"stress_writes":151552,"stress_commits":4736,"stress_errors":0,"read_p50_us":9.073,"read_p95_us":30.155,"read_p99_us":77.716,"commit_p50_us":931.509,"commit_p95_us":12127.879,"commit_p99_us":27214.199,"database_bytes":20291584,"max_rss_kib":63168},
+    {"round":3,"engine":"csgdb-encrypted","open_ms":4.803,"bulk_insert_ms":281.632,"durable_autocommit_ms":1359.269,"point_read_ms":1201.457,"range_scan_ms":2092.932,"update_ms":1452.144,"stress_seconds":10.000,"stress_reads":3039127,"stress_writes":154880,"stress_commits":4840,"stress_errors":0,"read_p50_us":9.284,"read_p95_us":31.327,"read_p99_us":79.358,"commit_p50_us":965.149,"commit_p95_us":12183.267,"commit_p99_us":26593.744,"database_bytes":20291584,"max_rss_kib":56956}
+  ],
+  "encrypted_60_second_soak": {
+    "cache_bytes_per_connection": 4194304,
+    "stress_seconds": 60.009,
+    "stress_reads": 16257117,
+    "stress_writes": 925728,
+    "stress_commits": 28929,
+    "stress_errors": 0,
+    "read_p50_us": 9.735,
+    "read_p95_us": 40.460,
+    "read_p99_us": 90.315,
+    "commit_p50_us": 959.481,
+    "commit_p95_us": 12622.581,
+    "commit_p99_us": 23715.073,
+    "database_bytes": 20291584,
+    "max_rss_kib": 58184,
+    "integrity_ok": true
+  },
+  "encrypted_cache_curve": [
+    {"cache_bytes_per_connection":4194304,"point_read_ms":1184.232,"range_scan_ms":2092.932,"update_ms":1521.301,"stress_reads":3006441,"read_p50_us":9.284,"max_rss_kib":60328,"sample":"three-round median"},
+    {"cache_bytes_per_connection":8388608,"point_read_ms":964.313,"range_scan_ms":966.972,"update_ms":1239.944,"stress_reads":3169412,"read_p50_us":9.464,"max_rss_kib":82068,"sample":"single cache-curve run"},
+    {"cache_bytes_per_connection":16777216,"point_read_ms":489.683,"range_scan_ms":252.716,"update_ms":451.654,"stress_reads":3121880,"read_p50_us":9.794,"max_rss_kib":127508,"sample":"single cache-curve run"}
+  ]
+}

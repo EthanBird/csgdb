@@ -168,6 +168,8 @@ typedef struct csgdb_open_options {
 
 如果调用方没有指定 `ENCRYPTED` 或 `PLAINTEXT`，实现自动补充 `ENCRYPTED`。二者同时出现时返回 `INVALID_OPEN_FLAGS`。
 
+默认的 `FULLMUTEX` 允许多个线程串行使用同一个连接。显式选择 `NOMUTEX` 可以减少连接内互斥开销，但调用方必须保证同一连接及其 Statement 不会被多个线程并发调用；不同连接仍可并发工作。连接池内部遵守每个连接单一所有者的约束。
+
 明文必须显式启用：
 
 ```c
@@ -764,7 +766,9 @@ pool.execute(
 let count = pool.query_i64("SELECT count(*) FROM event")?;
 ```
 
-打开时先创建一个可写连接并启用 WAL，再使用同一个已解析密钥打开固定数量的文件级只读连接。默认值为 2 个读连接和 64 个等待写任务。默认 Group Commit 最多合并 8 个相邻逻辑任务，收集窗口为 250 微秒；默认每 32 次写线程提交运行一次 PASSIVE Checkpoint，未回收 WAL 软上限为 4096 帧。内存数据库不支持多连接池，应继续使用单连接 `Database`。
+打开时先创建一个可写连接并启用 WAL，再使用同一个已解析密钥打开固定数量的文件级只读连接。默认值为 2 个读连接和 64 个等待写任务。默认 Group Commit 最多合并 8 个相邻逻辑任务，收集窗口为 250 微秒；默认每 32 次写线程提交运行一次 PASSIVE Checkpoint，未回收 WAL 软上限为 4096 帧。连接池保证每个连接同一时刻只有一个所有者，因此池内使用轻量连接模式；普通 `Database` 和 C API 的默认 `FULLMUTEX` 兼容行为不变。内存数据库不支持多连接池，应继续使用单连接 `Database`。
+
+池内每连接页缓存为 `min(cache_size_bytes, memory_budget_bytes / (read_connections + 1))`，并向下对齐到 KiB。默认 2 读 1 写时仍为每连接 16 MiB；增加连接数不会令所有页缓存之和越过池级内存预算。预算连每个连接 1 KiB 都无法提供时，打开返回 `InvalidPoolConfiguration`。
 
 多个参数化写入可以作为单个队列任务和单个事务提交：
 
@@ -852,7 +856,7 @@ let result = pool.write_with_policy(
 
 `checkpoint`、`checkpoint_database`、`set_wal_autocheckpoint` 和 `set_automatic_wal_maintenance` 也通过单写线程串行执行，避免与普通写任务同时操作维护状态。调用 `set_wal_autocheckpoint` 会切换到引擎本地策略并关闭管理器自动维护；`set_automatic_wal_maintenance` 会关闭引擎本地阈值并重新启用或替换管理器策略。
 
-`stats()` 返回读连接使用量、当前排队任务、写线程活动状态、提交/完成/拒绝计数、物理 Group Commit 次数、实际合并任务数、最大批次、自动 Checkpoint 次数、维护失败、最近 WAL 帧数、未回收帧数和压力状态。`interrupt_writer()` 可从控制线程取消当前写任务。`close()` 只有在其他池克隆全部释放后才成功，否则返回 `ConnectionManagerInUse`。
+`stats()` 返回读连接使用量、实际每连接页缓存 `cache_bytes_per_connection`、当前排队任务、写线程活动状态、提交/完成/拒绝计数、物理 Group Commit 次数、实际合并任务数、最大批次、自动 Checkpoint 次数、维护失败、最近 WAL 帧数、未回收帧数和压力状态。`interrupt_writer()` 可从控制线程取消当前写任务。`close()` 只有在其他池克隆全部释放后才成功，否则返回 `ConnectionManagerInUse`。
 
 异步接口通过专用数据库工作线程实现，不要求底层文件 I/O 伪装成异步操作。
 
