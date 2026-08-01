@@ -8,6 +8,10 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+fault-injection = ["csgdb-storage/fault-injection"]
+
 [dependencies]
 csgdb-core = { path = "../csgdb-core" }
 csgdb-derive = { path = "../csgdb-derive" }

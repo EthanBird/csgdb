@@ -287,8 +287,8 @@ pub unsafe extern "C" fn csgdb_open(path: *const c_char, out_db: *mut *mut Csgdb
 /// # Safety
 ///
 /// `path` must point to a valid NUL-terminated UTF-8 string. `out_db` must
-/// point to writable storage for one database handle. `vfs` is reserved and
-/// must currently be null.
+/// point to writable storage for one database handle. `vfs` may be null to
+/// select the default VFS or name a registered VFS.
 #[no_mangle]
 pub unsafe extern "C" fn csgdb_open_v2(
     path: *const c_char,
@@ -300,9 +300,14 @@ pub unsafe extern "C" fn csgdb_open_v2(
     if !unsafe { clear_output(out_db) } {
         return CSGDB_INVALID_ARGUMENT;
     }
-    if !vfs.is_null() {
-        return CSGDB_INVALID_ARGUMENT;
-    }
+    let vfs = if vfs.is_null() {
+        None
+    } else {
+        match c_string(vfs) {
+            Ok(vfs) => Some(vfs.to_owned()),
+            Err(code) => return code,
+        }
+    };
     // SAFETY: forwarded caller contract is unchanged.
     unsafe {
         open_from(path, out_db, |path| {
@@ -312,7 +317,11 @@ pub unsafe extern "C" fn csgdb_open_v2(
                     "open flags contain unknown bits",
                 )
             })?;
-            Database::builder(path).flags(flags).open()
+            let builder = Database::builder(path).flags(flags);
+            match vfs {
+                Some(vfs) => builder.vfs(vfs).open(),
+                None => builder.open(),
+            }
         })
     }
 }
@@ -375,7 +384,6 @@ pub unsafe extern "C" fn csgdb_open_v3(
     let options = unsafe { &*options };
     if usize::try_from(options.struct_size).unwrap_or(0) < std::mem::size_of::<csgdb_open_options>()
         || options.abi_version != ABI_VERSION
-        || !options.vfs.is_null()
         || !options.device_profile.is_null()
     {
         return CSGDB_INVALID_ARGUMENT;
@@ -383,6 +391,14 @@ pub unsafe extern "C" fn csgdb_open_v3(
 
     let Some(flags) = OpenFlags::from_bits(options.flags) else {
         return CSGDB_INVALID_OPEN_FLAGS;
+    };
+    let vfs = if options.vfs.is_null() {
+        None
+    } else {
+        match c_string(options.vfs) {
+            Ok(vfs) => Some(vfs.to_owned()),
+            Err(code) => return code,
+        }
     };
     // SAFETY: nested key storage follows the caller contract.
     let key = match unsafe { parse_key_source(&options.key) } {
@@ -394,6 +410,7 @@ pub unsafe extern "C" fn csgdb_open_v3(
         busy_timeout: Duration::from_millis(u64::from(options.busy_timeout_ms)),
         cache_size_bytes: options.cache_size_bytes,
         memory_budget_bytes: options.memory_budget_bytes,
+        vfs,
         key,
         auto_key_provider: None,
     };
@@ -1751,6 +1768,8 @@ fn error_code(error: &Error) -> i32 {
         ErrorCode::InvalidParameterIndex | ErrorCode::InvalidColumnIndex => CSGDB_RANGE,
         ErrorCode::InvalidStatementState => CSGDB_MISUSE,
         ErrorCode::InvalidPath
+        | ErrorCode::InvalidVfs
+        | ErrorCode::InvalidFaultRule
         | ErrorCode::InvalidSql
         | ErrorCode::ParameterCountMismatch
         | ErrorCode::InvalidColumnType
@@ -1806,6 +1825,13 @@ mod tests {
         let base = path.to_string_lossy();
         let _ = fs::remove_file(format!("{base}-wal"));
         let _ = fs::remove_file(format!("{base}-shm"));
+    }
+
+    fn default_vfs_name() -> CString {
+        assert_eq!(unsafe { sqlite::sqlite3_initialize() }, sqlite::SQLITE_OK);
+        let default_vfs = unsafe { sqlite::sqlite3_vfs_find(ptr::null()) };
+        assert!(!default_vfs.is_null());
+        unsafe { CStr::from_ptr((*default_vfs).zName) }.to_owned()
     }
 
     #[test]
@@ -1868,9 +1894,27 @@ mod tests {
     fn plaintext_v2_open_is_explicit() {
         let (path, c_path) = test_path("plaintext");
         let flags = (OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::PLAINTEXT).bits();
+        let vfs_name = default_vfs_name();
         let mut database = ptr::null_mut();
         let result =
-            unsafe { csgdb_open_v2(c_path.as_ptr(), &raw mut database, flags, ptr::null()) };
+            unsafe { csgdb_open_v2(c_path.as_ptr(), &raw mut database, flags, vfs_name.as_ptr()) };
+        assert_eq!(result, CSGDB_OK);
+        assert_eq!(unsafe { csgdb_close(database) }, CSGDB_OK);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn plaintext_v3_accepts_a_registered_vfs() {
+        let (path, c_path) = test_path("plaintext-v3-vfs");
+        let vfs_name = default_vfs_name();
+        let options = csgdb_open_options {
+            flags: (OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::PLAINTEXT).bits(),
+            vfs: vfs_name.as_ptr(),
+            ..csgdb_open_options::default()
+        };
+        let mut database = ptr::null_mut();
+        let result =
+            unsafe { csgdb_open_v3(c_path.as_ptr(), &raw mut database, &raw const options) };
         assert_eq!(result, CSGDB_OK);
         assert_eq!(unsafe { csgdb_close(database) }, CSGDB_OK);
         remove_database(&path);

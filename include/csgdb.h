@@ -90,6 +90,7 @@ typedef struct csgdb_open_options {
     uint32_t busy_timeout_ms;
     uint64_t cache_size_bytes;
     uint64_t memory_budget_bytes;
+    /* NULL for the platform default, otherwise a registered UTF-8 VFS name. */
     const char *vfs;
     const char *device_profile;
     csgdb_key_source key;
@@ -106,6 +107,7 @@ CSGDB_API int32_t csgdb_open_v2(
     const char *path,
     csgdb **out_db,
     uint32_t flags,
+    /* NULL for the platform default, otherwise a registered UTF-8 VFS name. */
     const char *vfs
 );
 CSGDB_API int32_t csgdb_open_with_key(

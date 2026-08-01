@@ -10,6 +10,7 @@ use std::time::Duration;
 pub const DEFAULT_BUSY_TIMEOUT_MS: u32 = 5_000;
 pub const DEFAULT_CACHE_SIZE_BYTES: u64 = 16 * 1024 * 1024;
 pub const DEFAULT_MEMORY_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_VFS_NAME_BYTES: usize = 255;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[repr(transparent)]
@@ -94,6 +95,8 @@ pub struct OpenOptions {
     pub busy_timeout: Duration,
     pub cache_size_bytes: u64,
     pub memory_budget_bytes: u64,
+    /// Optional registered storage VFS name. `None` selects the platform default.
+    pub vfs: Option<String>,
     pub key: KeySource,
     pub auto_key_provider: Option<Arc<dyn KeyProvider>>,
 }
@@ -108,6 +111,7 @@ impl Default for OpenOptions {
             busy_timeout: Duration::from_millis(u64::from(DEFAULT_BUSY_TIMEOUT_MS)),
             cache_size_bytes: DEFAULT_CACHE_SIZE_BYTES,
             memory_budget_bytes: DEFAULT_MEMORY_BUDGET_BYTES,
+            vfs: None,
             key: KeySource::Auto,
             auto_key_provider: None,
         }
@@ -122,6 +126,7 @@ impl fmt::Debug for OpenOptions {
             .field("busy_timeout", &self.busy_timeout)
             .field("cache_size_bytes", &self.cache_size_bytes)
             .field("memory_budget_bytes", &self.memory_budget_bytes)
+            .field("vfs", &self.vfs)
             .field("key", &self.key)
             .field(
                 "auto_key_provider",
@@ -140,6 +145,7 @@ pub struct OpenPlan {
     busy_timeout: Duration,
     cache_size_bytes: u64,
     memory_budget_bytes: u64,
+    vfs: Option<String>,
     key: KeySource,
     auto_key_provider: Option<Arc<dyn KeyProvider>>,
 }
@@ -155,6 +161,7 @@ impl fmt::Debug for OpenPlan {
             .field("busy_timeout", &self.busy_timeout)
             .field("cache_size_bytes", &self.cache_size_bytes)
             .field("memory_budget_bytes", &self.memory_budget_bytes)
+            .field("vfs", &self.vfs)
             .field("key", &self.key)
             .field(
                 "auto_key_provider",
@@ -195,6 +202,11 @@ impl OpenPlan {
         self.memory_budget_bytes
     }
 
+    #[must_use]
+    pub fn vfs(&self) -> Option<&str> {
+        self.vfs.as_deref()
+    }
+
     /// Resolves the selected key source into an executable open plan.
     ///
     /// # Errors
@@ -219,6 +231,7 @@ impl OpenPlan {
             busy_timeout: self.busy_timeout,
             cache_size_bytes: self.cache_size_bytes,
             memory_budget_bytes: self.memory_budget_bytes,
+            vfs: self.vfs,
             key,
         })
     }
@@ -232,6 +245,7 @@ pub struct ResolvedOpenPlan {
     busy_timeout: Duration,
     cache_size_bytes: u64,
     memory_budget_bytes: u64,
+    vfs: Option<String>,
     key: Option<ResolvedKey>,
 }
 
@@ -288,6 +302,11 @@ impl ResolvedOpenPlan {
     }
 
     #[must_use]
+    pub fn vfs(&self) -> Option<&str> {
+        self.vfs.as_deref()
+    }
+
+    #[must_use]
     pub const fn has_key(&self) -> bool {
         self.key.is_some()
     }
@@ -315,6 +334,7 @@ impl fmt::Debug for ResolvedOpenPlan {
             .field("busy_timeout", &self.busy_timeout)
             .field("cache_size_bytes", &self.cache_size_bytes)
             .field("memory_budget_bytes", &self.memory_budget_bytes)
+            .field("vfs", &self.vfs)
             .field("key", &self.key.as_ref().map(|_| "[REDACTED]"))
             .finish()
     }
@@ -330,6 +350,7 @@ pub fn prepare_open(path: impl AsRef<Path>, mut options: OpenOptions) -> Result<
     let path = path.as_ref();
     let identity = DatabaseIdentity::from_path(path)?;
     options.flags = normalize_and_validate_flags(options.flags)?;
+    validate_vfs(options.vfs.as_deref())?;
     let security = if options.flags.contains(OpenFlags::PLAINTEXT) {
         SecurityMode::Plaintext
     } else {
@@ -344,9 +365,35 @@ pub fn prepare_open(path: impl AsRef<Path>, mut options: OpenOptions) -> Result<
         busy_timeout: options.busy_timeout,
         cache_size_bytes: options.cache_size_bytes,
         memory_budget_bytes: options.memory_budget_bytes,
+        vfs: options.vfs,
         key: options.key,
         auto_key_provider: options.auto_key_provider,
     })
+}
+
+fn validate_vfs(vfs: Option<&str>) -> Result<()> {
+    let Some(vfs) = vfs else {
+        return Ok(());
+    };
+    if vfs.is_empty() {
+        return Err(Error::new(
+            ErrorCode::InvalidVfs,
+            "VFS name must not be empty",
+        ));
+    }
+    if vfs.len() > MAX_VFS_NAME_BYTES {
+        return Err(Error::new(
+            ErrorCode::InvalidVfs,
+            "VFS name exceeds the supported byte length",
+        ));
+    }
+    if vfs.as_bytes().contains(&0) {
+        return Err(Error::new(
+            ErrorCode::InvalidVfs,
+            "VFS name must not contain a NUL byte",
+        ));
+    }
+    Ok(())
 }
 
 fn normalize_and_validate_flags(mut flags: OpenFlags) -> Result<OpenFlags> {
@@ -487,6 +534,36 @@ mod tests {
         };
         let plan = prepare_open("also.db", options).expect("valid plaintext plan");
         assert_eq!(plan.security(), SecurityMode::Plaintext);
+    }
+
+    #[test]
+    fn named_vfs_is_validated_and_preserved_in_the_resolved_plan() {
+        let options = OpenOptions {
+            vfs: Some("registered-test-vfs".to_owned()),
+            key: KeySource::Passphrase(SecretString::new("secret")),
+            ..OpenOptions::default()
+        };
+        let resolved = prepare_open("agent.db", options)
+            .expect("valid plan")
+            .resolve_key()
+            .expect("resolve key");
+        assert_eq!(resolved.vfs(), Some("registered-test-vfs"));
+    }
+
+    #[test]
+    fn invalid_vfs_names_are_rejected_before_storage_io() {
+        for name in [
+            String::new(),
+            "invalid\0vfs".to_owned(),
+            "v".repeat(MAX_VFS_NAME_BYTES + 1),
+        ] {
+            let options = OpenOptions {
+                vfs: Some(name),
+                ..OpenOptions::default()
+            };
+            let error = prepare_open("agent.db", options).expect_err("invalid VFS must fail");
+            assert_eq!(error.code(), ErrorCode::InvalidVfs);
+        }
     }
 
     #[test]

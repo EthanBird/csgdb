@@ -35,8 +35,10 @@ pub use csgdb_core::{
     prepare_open, CheckpointMode, CheckpointResult, DatabaseIdentity, Error, ErrorCode,
     KeyProvider, KeySource, OpenFlags, OpenOptions, OpenPlan, ResolvedKeyRef, ResolvedOpenPlan,
     Result, SecretKey, SecretString, SecurityMode, TransactionState, Value, ValueRef, ValueType,
-    ABI_VERSION, LIB_VERSION, LIB_VERSION_NUMBER, RAW_KEY_LENGTH, SOURCE_ID,
+    ABI_VERSION, LIB_VERSION, LIB_VERSION_NUMBER, MAX_VFS_NAME_BYTES, RAW_KEY_LENGTH, SOURCE_ID,
 };
+#[cfg(feature = "fault-injection")]
+pub use csgdb_storage::fault::{FaultRule, FaultSession, FaultStats, FaultTarget};
 pub use csgdb_storage::{
     InterruptHandle, Row, Rows, Statement, Transaction, DEFAULT_PREPARED_STATEMENT_CACHE_CAPACITY,
     MAX_WAL_AUTOCHECKPOINT_FRAMES,
@@ -85,6 +87,13 @@ impl DatabaseBuilder {
     #[must_use]
     pub fn flags(mut self, flags: OpenFlags) -> Self {
         self.options.flags = flags;
+        self
+    }
+
+    /// Selects a registered storage VFS by name.
+    #[must_use]
+    pub fn vfs(mut self, name: impl Into<String>) -> Self {
+        self.options.vfs = Some(name.into());
         self
     }
 

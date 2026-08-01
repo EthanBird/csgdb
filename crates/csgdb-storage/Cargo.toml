@@ -9,6 +9,10 @@ authors.workspace = true
 repository.workspace = true
 publish = false
 
+[features]
+default = []
+fault-injection = []
+
 [dependencies]
 csgdb-core = { path = "../csgdb-core" }
 rusqlite = { version = "0.39.0", default-features = false, features = [

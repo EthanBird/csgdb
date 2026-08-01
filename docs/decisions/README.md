@@ -18,3 +18,4 @@ NNNN-short-title.md
 - [0006：独立索引契约与显式事务迁移](0006-index-contract-and-explicit-migration.md)
 - [0007：类型化字段句柄作为查询身份边界](0007-typed-field-query-boundary.md)
 - [0008：有界类型化集合查询](0008-bounded-typed-collection-queries.md)
+- [0009：确定性 VFS 故障注入](0009-deterministic-vfs-fault-injection.md)

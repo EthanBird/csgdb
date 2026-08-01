@@ -6,6 +6,8 @@ use std::fmt;
 #[non_exhaustive]
 pub enum ErrorCode {
     InvalidOpenFlags,
+    InvalidVfs,
+    InvalidFaultRule,
     InvalidKeyLength,
     InvalidPath,
     InvalidSql,
@@ -44,6 +46,9 @@ pub enum ErrorCode {
     WriteTaskPanicked,
     ReentrantRead,
     ReentrantWrite,
+    StorageWriteFailed,
+    StorageSyncFailed,
+    StorageTruncateFailed,
     Storage,
 }
 

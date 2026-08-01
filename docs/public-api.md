@@ -187,6 +187,44 @@ Rust 使用明确命名：
 let db = Database::open_plaintext("legacy.db")?;
 ```
 
+### 5.1 VFS 选择
+
+Rust `OpenOptions::vfs`、`DatabaseBuilder::vfs`、C `csgdb_open_v2` 的 `vfs` 参数和 `csgdb_open_options.vfs` 已支持选择进程中注册的 VFS。`None`/`NULL` 使用平台默认值：
+
+```rust
+let db = Database::builder("agent.db")
+    .key(KeySource::Passphrase(SecretString::new("replace-with-a-secret")))
+    .vfs("application-registered-vfs")
+    .open()?;
+```
+
+```c
+csgdb_open_v2(
+    "legacy.db",
+    &db,
+    CSGDB_OPEN_READWRITE |
+    CSGDB_OPEN_CREATE |
+    CSGDB_OPEN_PLAINTEXT,
+    "application-registered-vfs"
+);
+```
+
+名称必须是非空 UTF-8，最多 255 字节且不含 NUL。该接口只选择已经注册的 VFS，不按名称加载动态代码。未注册名称会导致打开失败；不可信 Agent 计划不能控制该选项。连接池中的读写连接复用同一个已解析 VFS 配置。
+
+测试构建可以显式启用 `fault-injection` feature，使用 `FaultSession` 注册的透明 VFS 做确定性恢复测试。该 feature 默认关闭，不属于应用正常运行路径：
+
+```rust
+let session = FaultSession::start()?;
+let db = Database::builder("agent.db")
+    .key(KeySource::Passphrase(SecretString::new("replace-with-a-secret")))
+    .vfs(session.vfs_name())
+    .open()?;
+
+session.arm(FaultRule::sync_error(FaultTarget::WriteAheadLog, 1)?);
+```
+
+一次会话独占进程级注入状态；规则命中一次后自动解除。它用于测试，不替代目标设备真实掉电验证。
+
 ## 6. 密钥来源
 
 ```c
@@ -932,6 +970,18 @@ MigrationMismatch
 ```
 
 其中 `InvalidQuery` 表示类型化计划元数据无效或超过安全上限；`InvalidMigration` 表示调用方声明的迁移 ID 或版本端点本身无效；`MigrationMismatch` 表示迁移 ID 已对应其他端点，或数据库当前状态不在声明的旧/新端点上。这些 Rust 枚举当前不映射为新的 C ABI 数字。
+
+VFS 配置和 feature-gated 故障测试另外使用：
+
+```text
+InvalidVfs
+InvalidFaultRule
+StorageWriteFailed
+StorageSyncFailed
+StorageTruncateFailed
+```
+
+三类 `Storage*Failed` I/O 失败在 C ABI 中保持映射到现有 `STORAGE`，不扩张当前数字错误码；Rust 调用方可以据此区分恢复测试的失败阶段。
 
 ## 12. 版本与兼容承诺
 

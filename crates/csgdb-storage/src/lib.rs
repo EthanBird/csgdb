@@ -1,5 +1,8 @@
 //! SQLCipher-backed transaction kernel adapter.
 
+#[cfg(feature = "fault-injection")]
+pub mod fault;
+
 use csgdb_core::{
     CheckpointMode, CheckpointResult, Error, ErrorCode, OpenFlags as CoreOpenFlags, ResolvedKeyRef,
     ResolvedOpenPlan, Result, SecurityMode, TransactionState, Value, ValueRef, ValueType,
@@ -53,8 +56,12 @@ impl Connection {
             ConnectionAccess::ReadOnly => readonly_open_flags(plan.flags()),
         };
         let flags = sqlite_open_flags(flags);
-        let inner = SqlConnection::open_with_flags(plan.path(), flags)
-            .map_err(|error| map_open_error(&error))?;
+        let inner = if let Some(vfs) = plan.vfs() {
+            SqlConnection::open_with_flags_and_vfs(plan.path(), flags, vfs)
+        } else {
+            SqlConnection::open_with_flags(plan.path(), flags)
+        }
+        .map_err(|error| map_open_error(&error))?;
 
         if plan.security() == SecurityMode::Encrypted {
             plan.with_key(|key| apply_key(&inner, key))?;
@@ -925,24 +932,38 @@ fn map_open_error(error: &rusqlite::Error) -> Error {
 
 fn map_storage_error(error: &rusqlite::Error) -> Error {
     match error {
-        rusqlite::Error::SqliteFailure(failure, _) => match failure.code {
-            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked => {
-                Error::new(ErrorCode::DatabaseBusy, "database is busy or locked")
-            }
-            rusqlite::ErrorCode::ReadOnly => {
-                Error::new(ErrorCode::DatabaseReadOnly, "database is read-only")
-            }
-            rusqlite::ErrorCode::ConstraintViolation => {
-                Error::new(ErrorCode::ConstraintViolation, "database constraint failed")
-            }
-            rusqlite::ErrorCode::DatabaseCorrupt => {
-                Error::new(ErrorCode::DatabaseCorrupt, "database is corrupt")
-            }
-            rusqlite::ErrorCode::OperationInterrupted => Error::new(
-                ErrorCode::QueryInterrupted,
-                "database operation was interrupted",
+        rusqlite::Error::SqliteFailure(failure, _) => match failure.extended_code {
+            ffi::SQLITE_IOERR_WRITE => Error::new(
+                ErrorCode::StorageWriteFailed,
+                "database storage write failed",
             ),
-            _ => Error::new(ErrorCode::Storage, "database operation failed"),
+            ffi::SQLITE_IOERR_FSYNC => Error::new(
+                ErrorCode::StorageSyncFailed,
+                "database storage synchronization failed",
+            ),
+            ffi::SQLITE_IOERR_TRUNCATE => Error::new(
+                ErrorCode::StorageTruncateFailed,
+                "database storage truncation failed",
+            ),
+            _ => match failure.code {
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked => {
+                    Error::new(ErrorCode::DatabaseBusy, "database is busy or locked")
+                }
+                rusqlite::ErrorCode::ReadOnly => {
+                    Error::new(ErrorCode::DatabaseReadOnly, "database is read-only")
+                }
+                rusqlite::ErrorCode::ConstraintViolation => {
+                    Error::new(ErrorCode::ConstraintViolation, "database constraint failed")
+                }
+                rusqlite::ErrorCode::DatabaseCorrupt => {
+                    Error::new(ErrorCode::DatabaseCorrupt, "database is corrupt")
+                }
+                rusqlite::ErrorCode::OperationInterrupted => Error::new(
+                    ErrorCode::QueryInterrupted,
+                    "database operation was interrupted",
+                ),
+                _ => Error::new(ErrorCode::Storage, "database operation failed"),
+            },
         },
         rusqlite::Error::SqlInputError { .. } => {
             Error::new(ErrorCode::InvalidSql, "SQL statement is invalid")

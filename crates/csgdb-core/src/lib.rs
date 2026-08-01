@@ -17,6 +17,7 @@ pub use key::{DatabaseIdentity, KeyProvider, KeySource, SecretKey, SecretString,
 pub use open::{
     prepare_open, OpenFlags, OpenOptions, OpenPlan, ResolvedKeyRef, ResolvedOpenPlan, SecurityMode,
     DEFAULT_BUSY_TIMEOUT_MS, DEFAULT_CACHE_SIZE_BYTES, DEFAULT_MEMORY_BUDGET_BYTES,
+    MAX_VFS_NAME_BYTES,
 };
 pub use value::{Value, ValueRef, ValueType};
 pub use version::{ABI_VERSION, LIB_VERSION, LIB_VERSION_NUMBER, SOURCE_ID};
