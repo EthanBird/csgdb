@@ -4,6 +4,7 @@ use crate::{
 };
 use std::collections::HashSet;
 use std::fmt;
+use std::marker::PhantomData;
 
 const SCHEMA_REGISTRY_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS "__csgdb_schema" (
@@ -172,6 +173,113 @@ impl FieldSchema {
     #[must_use]
     pub const fn is_primary_key(&self) -> bool {
         self.primary_key
+    }
+}
+
+/// A small, copyable typed handle to one field of a collection.
+///
+/// Derive-generated handles such as `Memory::FIELD_TEXT` are the stable input
+/// boundary for typed query construction. The Rust constant name may change
+/// during a source refactor; [`CollectionField::id`] remains the persisted
+/// identity used by schema metadata and future query plans.
+pub struct CollectionField<C, T> {
+    schema: &'static FieldSchema,
+    marker: PhantomData<fn() -> (C, T)>,
+}
+
+impl<C, T> CollectionField<C, T> {
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn new(schema: &'static FieldSchema) -> Self {
+        Self {
+            schema,
+            marker: PhantomData,
+        }
+    }
+
+    #[must_use]
+    pub const fn id(&self) -> &'static str {
+        self.schema.id()
+    }
+
+    #[must_use]
+    pub const fn column(&self) -> &'static str {
+        self.schema.column()
+    }
+
+    #[must_use]
+    pub const fn column_type(&self) -> ColumnType {
+        self.schema.column_type()
+    }
+
+    #[must_use]
+    pub const fn is_nullable(&self) -> bool {
+        self.schema.is_nullable()
+    }
+
+    #[must_use]
+    pub const fn is_primary_key(&self) -> bool {
+        self.schema.is_primary_key()
+    }
+
+    #[must_use]
+    pub const fn schema(&self) -> &'static FieldSchema {
+        self.schema
+    }
+}
+
+impl<C: Collection, T: FieldValue> CollectionField<C, T> {
+    /// Returns the owning collection schema.
+    #[must_use]
+    pub fn collection(&self) -> &'static CollectionSchema {
+        C::schema()
+    }
+
+    /// Encodes a value using this field's statically known Rust type.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the value cannot be represented by the database
+    /// storage class.
+    pub fn encode(&self, value: &T) -> Result<Value> {
+        value.to_value()
+    }
+
+    /// Tests persistent identity across Rust record types and field types.
+    ///
+    /// This is useful when checking whether a source-level rename still points
+    /// to the same registered collection field.
+    #[must_use]
+    pub fn same_storage_field<OtherCollection, OtherValue>(
+        &self,
+        other: &CollectionField<OtherCollection, OtherValue>,
+    ) -> bool
+    where
+        OtherCollection: Collection,
+        OtherValue: FieldValue,
+    {
+        C::schema().id() == OtherCollection::schema().id() && self.id() == other.id()
+    }
+}
+
+impl<C, T> Copy for CollectionField<C, T> {}
+
+impl<C, T> Clone for CollectionField<C, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<C, T> fmt::Debug for CollectionField<C, T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CollectionField")
+            .field("id", &self.id())
+            .field("column", &self.column())
+            .field("column_type", &self.column_type())
+            .field("nullable", &self.is_nullable())
+            .field("primary_key", &self.is_primary_key())
+            .finish()
     }
 }
 
@@ -1726,6 +1834,31 @@ mod tests {
             active: true,
             payload: vec![1, 2, 3],
         }
+    }
+
+    #[test]
+    fn generated_field_constants_preserve_type_and_storage_identity() {
+        fn accepts_memory_text(_: CollectionField<Memory, String>) {}
+
+        accepts_memory_text(Memory::FIELD_TEXT);
+        assert_eq!(
+            std::mem::size_of_val(&Memory::FIELD_TEXT),
+            std::mem::size_of::<&FieldSchema>()
+        );
+        assert_eq!(Memory::FIELD_ID.id(), "agent.memory.id");
+        assert_eq!(Memory::FIELD_ID.column(), "id");
+        assert_eq!(Memory::FIELD_ID.column_type(), ColumnType::Integer);
+        assert!(Memory::FIELD_ID.is_primary_key());
+        assert!(!Memory::FIELD_ID.is_nullable());
+        assert_eq!(Memory::FIELD_TEXT.collection(), Memory::schema());
+        assert!(Memory::FIELD_TEXT.same_storage_field(&RenamedMemory::FIELD_BODY));
+        assert!(Memory::FIELD_PAYLOAD.same_storage_field(&RenamedMemory::FIELD_BYTES));
+        assert!(!Memory::FIELD_TEXT.same_storage_field(&Memory::FIELD_SCORE));
+        assert_eq!(
+            Memory::FIELD_TEXT.encode(&"typed field".to_owned()),
+            Ok(Value::Text("typed field".to_owned()))
+        );
+        assert_eq!(Memory::FIELD_SCORE.encode(&None), Ok(Value::Null));
     }
 
     #[test]

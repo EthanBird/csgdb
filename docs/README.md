@@ -13,7 +13,7 @@
 7. [测试与发布门槛](testing.md)：正确性、安全、兼容性和性能验证。
 8. [构建基线](build-baseline.md)：已验证工具链、构建时间和产物大小。
 9. [开发路线](development-plan.md)：里程碑、依赖和完成定义。
-10. [架构决策](decisions/README.md)：已经接受的公共接口、连接、Group Commit、WAL 维护、类型化 Schema、索引和迁移约束。
+10. [架构决策](decisions/README.md)：已经接受的公共接口、连接、Group Commit、WAL 维护、类型化 Schema、索引、迁移和查询字段身份约束。
 
 ## 文档规范
 

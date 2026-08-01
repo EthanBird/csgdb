@@ -16,7 +16,7 @@ CSGDB（Context-State-Graph Database）是一套面向终端智能体的本地�
 
 ## 当前状态
 
-CSGDB 已进入 M1。当前代码已经能够创建和重开真实加密 `.db`，执行 SQL，提交或回滚事务，并通过 Rust API 与 C ABI 使用；显式明文模式生成普通兼容数据库。Rust 和 C 接口均已支持预编译语句、五类动态值、参数绑定和流式逐行读取，Rust 连接还提供有界 LRU Statement Cache。连接级变更计数、事务与只读状态、忙等待配置、内存回收和跨线程查询取消也已可用。可选的 `DatabasePool` 已实现真实只读连接池、单写线程、有界队列、三种背压策略、WAL 快照读取、参数化批量事务和有界 Group Commit；四种可控 Checkpoint、自动维护、WAL 压力观测和长快照恢复也已经贯通。类型化 `Collection`、稳定 Schema 指纹、复合/唯一索引元数据、事务化注册、显式幂等迁移以及单连接、事务和连接池 CRUD 已经可用。下一切片将推进断电故障注入和查询字段常量。
+CSGDB 已进入 M1。当前代码已经能够创建和重开真实加密 `.db`，执行 SQL，提交或回滚事务，并通过 Rust API 与 C ABI 使用；显式明文模式生成普通兼容数据库。Rust 和 C 接口均已支持预编译语句、五类动态值、参数绑定和流式逐行读取，Rust 连接还提供有界 LRU Statement Cache。连接级变更计数、事务与只读状态、忙等待配置、内存回收和跨线程查询取消也已可用。可选的 `DatabasePool` 已实现真实只读连接池、单写线程、有界队列、三种背压策略、WAL 快照读取、参数化批量事务和有界 Group Commit；四种可控 Checkpoint、自动维护、WAL 压力观测和长快照恢复也已经贯通。类型化 `Collection`、稳定 Schema 指纹、复合/唯一索引元数据、事务化注册、显式幂等迁移、类型安全字段句柄以及单连接、事务和连接池 CRUD 已经可用。真实子进程中止测试已覆盖未提交写入和迁移提交边界。下一切片将推进 VFS 故障注入和结构化查询谓词 IR。
 
 尚未发布可用于生产环境的版本，也不应将当前设计文档视为已经实现的安全保证。
 
@@ -59,6 +59,7 @@ db.insert(&Memory {
 
 let memory = db.get::<Memory>(&1)?.expect("inserted memory");
 assert_eq!(memory.text, "first memory");
+assert_eq!(Memory::FIELD_TEXT.id(), "agent.memory.text");
 
 # Ok::<(), csgdb::Error>(())
 ```

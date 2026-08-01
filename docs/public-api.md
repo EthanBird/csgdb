@@ -421,6 +421,10 @@ let mut memory = db.get::<Memory>(&1)?.expect("record exists");
 memory.score = None;
 db.update(&memory)?;
 db.delete::<Memory>(&1)?;
+
+let text_field = Memory::FIELD_TEXT;
+assert_eq!(text_field.id(), "agent.memory.text");
+assert_eq!(text_field.column(), "text");
 ```
 
 当前 derive 支持 `i8/i16/i32/i64`、`u8/u16/u32/u64`、`f32/f64`、`bool`、`String`、`Vec<u8>` 及其单层 `Option<T>`。无符号整数在写入前检查是否超出数据库有符号 64 位整数范围；读取时不进行跨存储类型隐式转换，非法布尔值和数值越界返回稳定错误。
@@ -436,6 +440,24 @@ db.delete::<Memory>(&1)?;
 - 索引具有独立规范和指纹，不改变基础 Collection 指纹；同一集合版本的索引集合仍必须精确匹配注册表；
 - Rust 类型名、Rust 字段名和声明顺序不进入规范描述；
 - 泛型结构体、元组结构体、嵌套 `Option` 和未支持字段类型在编译期拒绝。
+
+derive 还会将每个 Rust 字段名转换为大写 `FIELD_*` 关联常量。例如 `namespace: String` 生成 `Memory::FIELD_NAMESPACE: CollectionField<Memory, String>`，`score: Option<f64>` 生成 `CollectionField<Memory, Option<f64>>`。句柄只有一个静态元数据指针的大小，可以读取稳定字段 ID、物理列、存储类型、可空性和主键标记，也可以用静态 Rust 类型编码参数：
+
+```rust
+use csgdb::{CollectionField, Value};
+
+fn requires_memory_text(_: CollectionField<Memory, String>) {}
+
+requires_memory_text(Memory::FIELD_TEXT);
+assert_eq!(
+    Memory::FIELD_TEXT.encode(&"hello".to_owned())?,
+    Value::Text("hello".to_owned()),
+);
+```
+
+`FIELD_*` 名称属于 Rust 源码 API，字段重命名会相应改变常量名；`CollectionField::id()` 才是持久化和序列化查询计划使用的稳定身份。两个不同 Rust 记录类型可以通过 `same_storage_field` 判断是否仍指向相同集合 ID 与字段 ID。宏会拒绝大小写归一后产生同名 `FIELD_*` 的字段组合。
+
+当前句柄只建立安全身份和类型边界，不直接执行查询，也不允许把未经验证的 SQL 片段塞入 IR。结构化比较、布尔组合、排序和投影将在查询 IR 层基于这些句柄构造。
 
 依赖通常命名为 `csgdb`。如果调用方在 `Cargo.toml` 中使用了别名，可以在结构体属性中增加 `crate = "别名"`，让宏生成对应路径，而无需额外的运行时依赖。
 

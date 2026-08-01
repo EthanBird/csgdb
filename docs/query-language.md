@@ -14,6 +14,29 @@ CSG-Q 是类型化混合查询系统，不是 SQL 字符串生成器。它需要
 
 ## 2. 双前端
 
+### 2.0 已实现的字段身份基础
+
+`#[derive(Collection)]` 已为每个字段生成类型化句柄：
+
+```rust
+let field = Memory::FIELD_NAMESPACE;
+
+assert_eq!(field.id(), "agent.memory.namespace");
+assert_eq!(field.column(), "namespace");
+```
+
+其具体类型是 `CollectionField<Memory, String>`。因此集合和字段值类型可以直接参与 Rust 泛型检查，而稳定字段 ID 可以进入可序列化查询计划；物理列名只由已注册 Schema 解析，不作为 Agent 输入。字段句柄保持为一个静态元数据指针的大小，不在普通记录访问路径执行哈希或注册表查询。
+
+这一层刻意不提供字符串拼接或立即执行。下一步的 `Predicate`、`Order` 和 `Projection` IR 将以 `CollectionField` 为唯一字段入口，类似：
+
+```rust,ignore
+let predicate = Memory::FIELD_NAMESPACE
+    .eq(namespace)
+    .and(Memory::FIELD_SCORE.ge(0.7));
+```
+
+上例是下一切片接口方向，不是当前已稳定 API。
+
 ### 2.1 Rust 编译期 DSL
 
 供应用开发者使用，通过函数式过程宏生成类型化 IR：

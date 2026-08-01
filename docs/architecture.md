@@ -54,14 +54,15 @@ CSGDB 是进程内嵌入式数据库，主要服务终端 AI Agent。系统需�
 `#[derive(Collection)]` 生成：
 
 - 稳定集合和字段标识；
+- 指针大小的 `CollectionField<Collection, Value>` 类型化字段句柄；
 - 列类型与空值规则；
 - 编解码器；
 - Schema 指纹；
 - 建表、索引和基础 CRUD 语句。
 
-当前实现要求集合 ID、表名、字段 ID、列名、版本和主键全部显式声明。规范描述按字段 ID 排序并在编译期计算 SHA-256 指纹，因此 Rust 类型名、字段名和字段排列不参与持久化身份。索引使用稳定索引 ID、显式物理名称和有序字段 ID 列表，具有独立的 `csgdb-index-v1` 描述和指纹，不改变已有基础 Schema 指纹。首次注册在一个事务中建立或验证物理表与索引，并分别写入 `__csgdb_schema` 和 `__csgdb_index_schema`；已有注册不匹配时返回 `SchemaMismatch`。
+当前实现要求集合 ID、表名、字段 ID、列名、版本和主键全部显式声明。规范描述按字段 ID 排序并在编译期计算 SHA-256 指纹，因此 Rust 类型名、字段名和字段排列不参与持久化身份。宏为每个 Rust 字段生成 `Collection::FIELD_*` 常量，其类型同时携带集合类型和字段值类型，稳定 ID 仍来自显式元数据。索引使用稳定索引 ID、显式物理名称和有序字段 ID 列表，具有独立的 `csgdb-index-v1` 描述和指纹，不改变已有基础 Schema 指纹。首次注册在一个事务中建立或验证物理表与索引，并分别写入 `__csgdb_schema` 和 `__csgdb_index_schema`；已有注册不匹配时返回 `SchemaMismatch`。
 
-`migrate_collection<From, To>` 要求相同集合 ID、严格递增版本、不同指纹和稳定迁移 ID。调用方在同一事务内执行必要的 DDL/数据转换，框架随后验证目标物理 Schema、重建发生变化的派生索引、更新注册表并记录 `__csgdb_migration`。任一步骤出错或 panic 都由事务 Drop 回滚；成功记录可幂等重放。当前是短时独占写事务，影子表、双写和进程中止后续跑属于 M6 在线迁移状态机。
+`migrate_collection<From, To>` 要求相同集合 ID、严格递增版本、不同指纹和稳定迁移 ID。调用方在同一事务内执行必要的 DDL/数据转换，框架随后验证目标物理 Schema、重建发生变化的派生索引、更新注册表并记录 `__csgdb_migration`。任一步骤出错或 panic 都由事务 Drop 回滚；成功记录可幂等重放。真实子进程测试还会在事务中途直接 `abort`，验证重开恢复。当前是短时独占写事务，影子表、双写和多阶段在线迁移后续跑属于 M6 状态机。
 
 ### 3.3 查询层
 

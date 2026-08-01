@@ -10,8 +10,9 @@ mod collection;
 mod pool;
 
 pub use collection::{
-    Collection, CollectionCrud, CollectionSchema, ColumnType, FieldSchema, FieldValue, IndexSchema,
-    MigrationStatus, RegisteredSchema, SchemaFingerprint, SchemaRegistration,
+    Collection, CollectionCrud, CollectionField, CollectionSchema, ColumnType, FieldSchema,
+    FieldValue, IndexSchema, MigrationStatus, RegisteredSchema, SchemaFingerprint,
+    SchemaRegistration,
 };
 pub use csgdb_derive::Collection;
 

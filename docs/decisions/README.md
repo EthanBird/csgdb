@@ -16,3 +16,4 @@ NNNN-short-title.md
 - [0004：有界 Group Commit 与 WAL 压力维护](0004-bounded-group-commit-and-wal-pressure.md)
 - [0005：显式稳定 Collection Schema 与指纹注册](0005-stable-collection-schema.md)
 - [0006：独立索引契约与显式事务迁移](0006-index-contract-and-explicit-migration.md)
+- [0007：类型化字段句柄作为查询身份边界](0007-typed-field-query-boundary.md)

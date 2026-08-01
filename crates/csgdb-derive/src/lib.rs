@@ -16,8 +16,10 @@ use syn::{
 ///
 /// The struct-level `csgdb` attribute requires `collection`, `table`, and
 /// `version`. Every field requires `id` and `column`; exactly one field must
-/// also specify `primary_key`. An optional struct-level `crate` string selects
-/// a renamed CSGDB dependency path.
+/// also specify `primary_key`. Struct-level `index(...)` declarations create
+/// stable ordinary, composite, or unique indexes. The expansion also exposes
+/// a typed `FIELD_*` associated constant for every Rust field. An optional
+/// struct-level `crate` string selects a renamed CSGDB dependency path.
 pub fn derive_collection(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     expand_collection(&input)
@@ -199,6 +201,41 @@ fn expand_collection(input: &DeriveInput) -> syn::Result<TokenStream2> {
     let name = &input.ident;
     let field_count = derived_fields.len();
     let index_count = indexes.len();
+    let mut generated_field_names = HashSet::with_capacity(field_count);
+    let field_constants = derived_fields
+        .iter()
+        .map(|field| {
+            let constant_name = field_constant_name(field.rust_name);
+            if !generated_field_names.insert(constant_name.clone()) {
+                return Err(syn::Error::new_spanned(
+                    field.rust_name,
+                    "field names collide after conversion to generated FIELD_* constants",
+                ));
+            }
+            let constant = format_ident!("{constant_name}");
+            let ty = field.ty;
+            let id = &field.id;
+            let column = &field.column;
+            let nullable = field.nullable;
+            let primary_key = field.primary_key;
+            let column_type = format_ident!("{}", field.storage);
+            let documentation = format!(
+                "Typed handle for stable field `{}` stored in column `{}`.",
+                field.id, field.column
+            );
+            Ok(quote! {
+                #[doc = #documentation]
+                pub const #constant: #crate_path::CollectionField<Self, #ty> =
+                    #crate_path::CollectionField::new(&#crate_path::FieldSchema::new(
+                        #id,
+                        #column,
+                        #crate_path::ColumnType::#column_type,
+                        #nullable,
+                        #primary_key,
+                    ));
+            })
+        })
+        .collect::<syn::Result<Vec<_>>>()?;
     let field_schemas = derived_fields.iter().map(|field| {
         let id = &field.id;
         let column = &field.column;
@@ -250,6 +287,11 @@ fn expand_collection(input: &DeriveInput) -> syn::Result<TokenStream2> {
 
     Ok(quote! {
         #[automatically_derived]
+        impl #name {
+            #(#field_constants)*
+        }
+
+        #[automatically_derived]
         impl #crate_path::Collection for #name {
             type Key = #primary_key_type;
 
@@ -294,6 +336,12 @@ fn expand_collection(input: &DeriveInput) -> syn::Result<TokenStream2> {
             }
         }
     })
+}
+
+fn field_constant_name(ident: &Ident) -> String {
+    let rust_name = ident.to_string();
+    let rust_name = rust_name.strip_prefix("r#").unwrap_or(&rust_name);
+    format!("FIELD_{}", rust_name.to_uppercase())
 }
 
 fn parse_collection_attributes(input: &DeriveInput) -> syn::Result<CollectionAttributes> {
@@ -700,4 +748,57 @@ fn quoted_columns(fields: &[DerivedField<'_>]) -> String {
 
 fn quote_identifier(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use syn::parse_quote;
+
+    #[test]
+    fn expansion_generates_typed_field_constants() {
+        let input: DeriveInput = parse_quote! {
+            #[csgdb(collection = "agent.memory", table = "memory", version = 1)]
+            struct Memory {
+                #[csgdb(id = "agent.memory.id", column = "id", primary_key)]
+                id: i64,
+                #[csgdb(id = "agent.memory.text", column = "text")]
+                text: String,
+            }
+        };
+        let expanded = expand_collection(&input).expect("expand").to_string();
+        assert!(expanded.contains("FIELD_ID"));
+        assert!(expanded.contains("FIELD_TEXT"));
+        assert!(expanded.contains("CollectionField < Self , String >"));
+    }
+
+    #[test]
+    fn raw_field_identifier_has_a_valid_constant_name() {
+        let input: DeriveInput = parse_quote! {
+            #[csgdb(collection = "agent.keyword", table = "keyword", version = 1)]
+            struct Keyword {
+                #[csgdb(id = "agent.keyword.type", column = "type", primary_key)]
+                r#type: String,
+            }
+        };
+        let expanded = expand_collection(&input).expect("expand").to_string();
+        assert!(expanded.contains("FIELD_TYPE"));
+    }
+
+    #[test]
+    fn case_folded_field_constant_collisions_are_rejected() {
+        let input: DeriveInput = parse_quote! {
+            #[csgdb(collection = "agent.collision", table = "collision", version = 1)]
+            struct Collision {
+                #[csgdb(id = "agent.collision.lower", column = "lower", primary_key)]
+                foo: i64,
+                #[csgdb(id = "agent.collision.upper", column = "upper")]
+                FOO: i64,
+            }
+        };
+        let error = expand_collection(&input).expect_err("constant names must not collide");
+        assert!(error
+            .to_string()
+            .contains("collide after conversion to generated FIELD_* constants"));
+    }
 }
