@@ -16,7 +16,9 @@ CSGDB（Context-State-Graph Database）是一套面向终端智能体的本地�
 
 ## 当前状态
 
-CSGDB 已进入 M1。当前代码已经能够创建和重开真实加密 `.db`，执行 SQL，提交或回滚事务，并通过 Rust API 与 C ABI 使用；显式明文模式生成普通兼容数据库。Rust 和 C 接口均已支持预编译语句、五类动态值、参数绑定和流式逐行读取，Rust 连接还提供有界 LRU Statement Cache。连接级变更计数、事务与只读状态、忙等待配置、内存回收和跨线程查询取消也已可用。可选的 `DatabasePool` 已实现真实只读连接池、单写线程、有界队列、三种背压策略、WAL 快照读取、参数化批量事务和有界 Group Commit；四种可控 Checkpoint、自动维护、WAL 压力观测和长快照恢复也已经贯通。类型化 `Collection`、稳定 Schema 指纹、复合/唯一索引元数据、事务化注册、显式幂等迁移、类型安全字段句柄、CRUD，以及有硬上限的结构化谓词与排序查询已经可用。真实子进程中止测试和 feature-gated 确定性 VFS 矩阵已覆盖事务边界、WAL 部分写/同步、主文件 Checkpoint 写及 WAL 截断失败。第二轮底层优化后，固定 4 MiB 缓存的默认加密四读一写中位读取达到系统 SQLite 的 96.5%，写入达到 115.0%，读取 p95/p99 更低；随机点查、范围、更新、打开、空间和内存仍未全部超过 SQLite。性能继续作为发布阻塞项，下一切片优先验证有界已认证页缓存与版本化 AEAD 页格式，不提前转入 AgentPlan 功能开发。
+CSGDB 已进入 M1。当前代码已经能够创建和重开真实加密 `.db`，执行 SQL，提交或回滚事务，并通过 Rust API 与 C ABI 使用；显式明文模式生成普通兼容数据库。Rust 和 C 接口均已支持预编译语句、五类动态值、参数绑定和流式逐行读取，Rust 连接还提供有界 LRU Statement Cache。连接级变更计数、事务与只读状态、忙等待配置、内存回收和跨线程查询取消也已可用。可选的 `DatabasePool` 已实现真实只读连接池、单写线程、有界队列、三种背压策略、WAL 快照读取、参数化批量事务和有界 Group Commit；四种可控 Checkpoint、自动维护、WAL 压力观测和长快照恢复也已经贯通。类型化 `Collection`、稳定 Schema 指纹、复合/唯一索引元数据、事务化注册、显式幂等迁移、类型安全字段句柄、CRUD，以及有硬上限的结构化谓词、排序和 `exists` 查询已经可用。真实子进程中止测试和 feature-gated 确定性 VFS 矩阵已覆盖事务边界、WAL 部分写/同步、主文件 Checkpoint 写及 WAL 截断失败。
+
+第三轮查询优化新增显式 `query_i64_cached` 热路径和严格的查询/纯读/整机 Pareto 门。固定加密 SQL 的 8 轮中位吞吐从 437,600 提升到 919,016 ops/s，p50/p95/p99 与峰值 RSS 同时改善；但 17 条 SQL 超出默认缓存容量后会发生逐出抖动，因此缓存仍是显式接口，未替换默认查询路径。最新同机系统级 8 轮门中只有读 p99 超过系统 SQLite，点查、范围、p50/p95 和混合读吞吐仍未过线。性能继续作为发布阻塞项；完整边界见 [第三轮查询性能报告](docs/query-performance-round3-2026-08-02.html)，未通过前不宣称整体性能达标。
 
 尚未发布可用于生产环境的版本，也不应将当前设计文档视为已经实现的安全保证。
 
@@ -169,6 +171,7 @@ CSG-Q 不以复刻 SQL 语法为目标。它将结构化查询、混合召回、
 - [2026-08-01 运行时性能基线](docs/performance-2026-08-01.md)
 - [2026-08-01 底层性能优化复测](docs/performance-optimization-2026-08-01.md)
 - [2026-08-01 底层性能优化第二轮](docs/performance-optimization-round2-2026-08-01.md)
+- [2026-08-02 查询性能第三轮](docs/query-performance-round3-2026-08-02.html)
 - [测试与发布门槛](docs/testing.md)
 - [开发路线](docs/development-plan.md)
 - [贡献指南](CONTRIBUTING.md)

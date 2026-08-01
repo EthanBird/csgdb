@@ -1,0 +1,245 @@
+{
+  "surface": "report",
+  "manifest": {
+    "version": 1,
+    "surface": "report",
+    "title": "CSGDB 查询性能第三轮",
+    "description": "固定热查询已显著加速，但系统级零退化门仍未通过。",
+    "generatedAt": "2026-08-01T20:18:34Z",
+    "sources": [
+      {
+        "id": "query_api",
+        "label": "加密 Rust 查询 API 八轮中位数",
+        "path": "benchmarks/results/2026-08-02-query-performance-round3.json"
+      },
+      {
+        "id": "system_query",
+        "label": "系统 SQLite 与加密 CSGDB 八轮中位数",
+        "path": "benchmarks/results/2026-08-02-query-performance-round3.json"
+      }
+    ],
+    "cards": [
+      {
+        "id": "fixed_speedup",
+        "description": "固定 SQL 上公开缓存 API 吞吐除以直接准备路径吞吐。",
+        "dataset": "headline",
+        "sourceId": "query_api",
+        "metrics": [
+          { "label": "固定查询加速倍数", "field": "fixed_speedup", "format": "number" }
+        ]
+      },
+      {
+        "id": "fixed_p99_reduction",
+        "description": "固定 SQL 上公开缓存 API 相对直接准备路径的 p99 降幅。",
+        "dataset": "headline",
+        "sourceId": "query_api",
+        "metrics": [
+          { "label": "固定查询 p99 降幅 (%)", "field": "fixed_p99_reduction_pct", "format": "number" }
+        ]
+      },
+      {
+        "id": "system_query_passed",
+        "description": "六个系统级查询指标中通过零退化中位门的数量。",
+        "dataset": "headline",
+        "sourceId": "system_query",
+        "metrics": [
+          { "label": "系统查询指标通过数", "field": "system_query_passed", "format": "number" }
+        ]
+      },
+      {
+        "id": "global_gate",
+        "description": "全指标严格 Pareto 门；1 为通过，0 为失败。",
+        "dataset": "headline",
+        "sourceId": "system_query",
+        "metrics": [
+          { "label": "全局门", "field": "global_gate_pass", "format": "number" }
+        ]
+      }
+    ],
+    "charts": [
+      {
+        "id": "query_throughput",
+        "title": "加密查询吞吐：显式缓存的适用边界",
+        "subtitle": "固定 SQL 与 16 条热 SQL 明显提速；第 17 条触发 LRU 抖动。",
+        "headerMarkdown": "越高越好；固定 CPU 0，1 轮预热，8 轮交错测量的中位数。",
+        "intent": "comparison",
+        "question": "公开的有界语句缓存在哪些工作集上提升查询吞吐？",
+        "rationale": "按工作集并列直接路径与显式缓存路径，避免平均值隐藏容量边界。",
+        "comparisonContext": {
+          "baseline": "direct-reference",
+          "grain": "工作集 × API 路径",
+          "unit": "operations per second"
+        },
+        "type": "bar",
+        "dataset": "query_api",
+        "sourceId": "query_api",
+        "valueFormat": "compact",
+        "unit": "ops/s",
+        "encodings": {
+          "x": { "field": "workload", "type": "nominal", "label": "工作集" },
+          "y": { "field": "throughput_ops_s", "type": "quantitative", "label": "中位吞吐", "format": "compact", "unit": "ops/s" },
+          "color": { "field": "mode", "type": "nominal", "label": "API 路径" },
+          "tooltip": [
+            { "field": "p99_ns", "type": "quantitative", "label": "p99", "format": "number", "unit": "ns" },
+            { "field": "vm_hwm_kib", "type": "quantitative", "label": "峰值 RSS", "format": "number", "unit": "KiB" }
+          ]
+        },
+        "legend": { "position": "bottom", "sort": "spec" },
+        "settings": { "groupMode": "grouped", "orientation": "vertical", "sort": "none" },
+        "surface": { "surface": "card", "interactiveLegend": true, "showControls": false, "viewMode": "both" }
+      },
+      {
+        "id": "system_query_gap",
+        "title": "加密 CSGDB 相对系统 SQLite 的查询改善率",
+        "subtitle": "正值为更好，负值为更慢；只有读 p99 通过。",
+        "headerMarkdown": "阶段时长和时延已反向归一化；吞吐保持原方向。零线是发布门。",
+        "intent": "comparison",
+        "question": "系统级查询指标距离全量超过 SQLite 还有多远？",
+        "rationale": "统一为“正值更好”后，能直接看出每个查询指标的方向与差距。",
+        "comparisonContext": {
+          "baseline": "system SQLite 3.45.1",
+          "grain": "查询指标",
+          "unit": "percent improvement"
+        },
+        "type": "bar",
+        "dataset": "system_query_gap",
+        "sourceId": "system_query",
+        "valueFormat": "number",
+        "unit": "%",
+        "encodings": {
+          "x": { "field": "metric", "type": "nominal", "label": "指标" },
+          "y": { "field": "improvement_pct", "type": "quantitative", "label": "相对改善", "format": "number", "unit": "%" },
+          "color": { "field": "status", "type": "nominal", "label": "门禁" },
+          "tooltip": [
+            { "field": "sqlite_median", "type": "quantitative", "label": "SQLite 中位数", "format": "number" },
+            { "field": "csgdb_median", "type": "quantitative", "label": "CSGDB 中位数", "format": "number" }
+          ]
+        },
+        "legend": { "position": "bottom", "sort": "spec" },
+        "settings": { "groupMode": "grouped", "orientation": "vertical", "sort": "none" },
+        "surface": { "surface": "card", "interactiveLegend": true, "showControls": false, "viewMode": "both" }
+      }
+    ],
+    "tables": [
+      {
+        "id": "query_api_detail",
+        "title": "查询 API 精确中位数",
+        "subtitle": "吞吐、p50/p95/p99 与峰值内存均纳入门禁。",
+        "dataset": "query_api",
+        "sourceId": "query_api",
+        "defaultSort": { "field": "workload", "direction": "asc" },
+        "density": "dense",
+        "columns": [
+          { "field": "workload", "label": "工作集", "type": "text" },
+          { "field": "mode", "label": "API 路径", "type": "text" },
+          { "field": "throughput_ops_s", "label": "吞吐 ops/s", "format": "number" },
+          { "field": "p50_ns", "label": "p50 ns", "format": "number" },
+          { "field": "p95_ns", "label": "p95 ns", "format": "number" },
+          { "field": "p99_ns", "label": "p99 ns", "format": "number" },
+          { "field": "vm_hwm_kib", "label": "峰值 RSS KiB", "format": "number" },
+          { "field": "status", "label": "场景门", "type": "text" }
+        ]
+      },
+      {
+        "id": "system_query_detail",
+        "title": "系统级查询指标",
+        "subtitle": "与系统 SQLite 使用相同 SQL、数据、4 MiB 页缓存和 fresh database。",
+        "dataset": "system_query_gap",
+        "sourceId": "system_query",
+        "defaultSort": { "field": "metric", "direction": "asc" },
+        "density": "dense",
+        "columns": [
+          { "field": "metric", "label": "指标", "type": "text" },
+          { "field": "sqlite_median", "label": "SQLite 中位数", "format": "number" },
+          { "field": "csgdb_median", "label": "CSGDB 中位数", "format": "number" },
+          { "field": "improvement_pct", "label": "改善率 %", "format": "number" },
+          { "field": "status", "label": "门禁", "type": "text" }
+        ]
+      }
+    ],
+    "blocks": [
+      { "id": "title", "type": "markdown", "body": "# CSGDB 查询性能第三轮" },
+      { "id": "summary", "type": "markdown", "sourceId": "system_query", "body": "## 结论\n\n**全局零退化门尚未通过。** 固定 SQL 的显式缓存路径吞吐提升 110.01%，p50/p95/p99 分别下降 53.71%/53.34%/52.71%，峰值 RSS 中位数下降 0.51%，因此作为明确的 opt-in API 保留。系统级比较仍有 5/6 个查询指标落后，不能宣称整体超过 SQLite。" },
+      { "id": "metrics", "type": "metric-strip", "cardIds": ["fixed_speedup", "fixed_p99_reduction", "system_query_passed", "global_gate"] },
+      { "id": "findings", "type": "markdown", "sourceId": "query_api", "body": "## 关键发现\n\n1. 重复固定 SQL 的主要浪费是反复编译语句；公开缓存入口消除了这部分成本，并在固定工作集上全指标通过。\n2. 16 条热 SQL 的吞吐与时延改善显著，但 RSS 中位数增加 0.63%，因此仍按失败处理。\n3. 17 条 SQL 超出默认容量后出现逐出抖动；复用门控准入虽消除了该抖动，hot16 RSS 仍回退 0.856%，因此两个方案都不能成为默认路径。\n4. 有界只读快照能显著加速点查，但会牺牲写吞吐或读延迟并放大 WAL，同样被淘汰。\n5. gprofng 显示 `sqlite3Codec` 占 35.36% inclusive、页 HMAC 占 22.12%、SHA-256 硬件路径占 15.43% exclusive；`csgdb_step` 包装仅占 0.12%，剩余主矛盾是缓存缺失后的认证/解密。" },
+      { "id": "query_chart", "type": "chart", "chartId": "query_throughput" },
+      { "id": "query_table", "type": "table", "tableId": "query_api_detail" },
+      { "id": "system_chart", "type": "chart", "chartId": "system_query_gap" },
+      { "id": "system_table", "type": "table", "tableId": "system_query_detail" },
+      { "id": "definitions", "type": "markdown", "body": "## 指标定义\n\n吞吐是测量窗口内完成的查询数除以墙钟时间。API 延迟是单次操作纳秒分位；系统压力延迟为微秒分位。峰值 RSS 使用进程高水位。改善率统一为正值更好。" },
+      { "id": "method", "type": "markdown", "sourceId": "query_api", "body": "## 方法\n\n查询 API 门使用加密数据库、固定 CPU 0、10,000 次预热、每轮 50,000 次操作和 8 轮平衡交错顺序。系统门使用 100,000 行、200,000 次点查、5,000 次范围查询、100,000 次更新、1,000 次耐久写和 5 秒四读一写压力；每次调用使用 fresh database，并记录实际加载动态库哈希。所有门使用零容忍中位 Pareto 规则。" },
+      { "id": "limitations", "type": "markdown", "body": "## 局限与稳健性\n\n数据来自单台 x86_64 主机和合成负载，不能外推到 ARM64 或全部 Agent 数据分布。系统动态库是 SQLite 3.45.1，CSGDB 内核是 3.50.4；虽然 SQL、数据与运行参数一致，这仍不是同版本源码构建对照。严格零容差会暴露主机噪声，因此结论只保留方向稳定、幅度显著且正确性一致的改动。本 HTML 在当前环境缺少 Chromium，只完成结构验证，未完成像素级截图检查。" },
+      { "id": "next", "type": "markdown", "body": "## 下一步\n\n缓存准入与有界只读快照原型已经因 RSS、读写吞吐或 WAL 回退而淘汰。下一切片只做不延长快照、不扩大常驻集的认证页缓存成本消除，以及 pager/WAL 锁路径的尾延迟剖析。任何候选只要吞吐、p50/p95/p99、RSS、文件体积、WAL 或写入指标之一回退，就立即淘汰。" },
+      { "id": "questions", "type": "markdown", "body": "## 待验证问题\n\n同一策略在 ARM64 SHA/AES 指令、2/4/8 MiB 内存档位、真实 Agent 热点分布和 30 分钟混合压力下是否仍保持 Pareto 改善？" }
+    ]
+  },
+  "snapshot": {
+    "version": 1,
+    "generatedAt": "2026-08-01T20:18:34Z",
+    "status": "ready",
+    "datasets": {
+      "headline": [
+        { "fixed_speedup": 2.1001, "fixed_p99_reduction_pct": 52.7105, "system_query_passed": 1, "global_gate_pass": 0 }
+      ],
+      "query_api": [
+        { "workload": "fixed", "mode": "direct-reference", "throughput_ops_s": 437600.199, "p50_ns": 2178.5, "p95_ns": 2284.5, "p99_ns": 2333.5, "vm_hwm_kib": 8172, "status": "pass" },
+        { "workload": "fixed", "mode": "public-query_i64_cached", "throughput_ops_s": 919016.252, "p50_ns": 1008.5, "p95_ns": 1066.0, "p99_ns": 1103.5, "vm_hwm_kib": 8130, "status": "pass" },
+        { "workload": "hot16", "mode": "direct-reference", "throughput_ops_s": 421227.297, "p50_ns": 2222.0, "p95_ns": 2326.0, "p99_ns": 2379.5, "vm_hwm_kib": 8226, "status": "fail: RSS" },
+        { "workload": "hot16", "mode": "public-query_i64_cached", "throughput_ops_s": 911097.109, "p50_ns": 1037.0, "p95_ns": 1109.0, "p99_ns": 1157.5, "vm_hwm_kib": 8278, "status": "fail: RSS" },
+        { "workload": "overflow17", "mode": "direct-reference", "throughput_ops_s": 434874.630, "p50_ns": 2200.5, "p95_ns": 2307.0, "p99_ns": 2349.0, "vm_hwm_kib": 8120, "status": "fail: cached path" },
+        { "workload": "overflow17", "mode": "public-query_i64_cached", "throughput_ops_s": 362069.502, "p50_ns": 2625.0, "p95_ns": 2778.0, "p99_ns": 2856.5, "vm_hwm_kib": 8322, "status": "fail: throughput/latency/RSS" }
+      ],
+      "system_query_gap": [
+        { "metric": "point read duration", "sqlite_median": 397.5375, "csgdb_median": 631.584, "improvement_pct": -58.874, "status": "fail" },
+        { "metric": "range scan duration", "sqlite_median": 417.8265, "csgdb_median": 982.0915, "improvement_pct": -135.048, "status": "fail" },
+        { "metric": "read p50", "sqlite_median": 2.3865, "csgdb_median": 4.311, "improvement_pct": -80.641, "status": "fail" },
+        { "metric": "read p95", "sqlite_median": 4.8435, "csgdb_median": 7.6025, "improvement_pct": -56.963, "status": "fail" },
+        { "metric": "read p99", "sqlite_median": 43.563, "csgdb_median": 42.9205, "improvement_pct": 1.475, "status": "pass" },
+        { "metric": "stress reads/s", "sqlite_median": 943859.659, "csgdb_median": 722374.195, "improvement_pct": -23.466, "status": "fail" }
+      ]
+    }
+  },
+  "sources": [
+    {
+      "id": "query_api",
+      "label": "加密 Rust 查询 API 八轮中位数",
+      "path": "benchmarks/results/2026-08-02-query-performance-round3.json",
+      "query": {
+        "engine": "duckdb",
+        "sql": "SELECT q.workload, q.mode, q.throughput_ops_s, q.p50_ns, q.p95_ns, q.p99_ns, q.vm_hwm_kib, q.scenario_pass FROM read_json_auto('benchmarks/results/2026-08-02-query-performance-round3.json') AS r, UNNEST(r.query_api) AS t(q)",
+        "description": "读取审阅后的加密查询 API 中位数。",
+        "executed_at": "2026-08-01T19:53:51.322190Z",
+        "language": "sql",
+        "tables_used": ["benchmarks/results/2026-08-02-query-performance-round3.json"],
+        "filters": ["security = encrypted", "8 balanced rounds", "warm-up excluded"],
+        "metric_definitions": [
+          "throughput_ops_s = completed measured queries / measured wall-clock seconds",
+          "latency percentiles are computed per round and medianed across rounds",
+          "scenario_pass requires every median metric to be non-regressing"
+        ]
+      }
+    },
+    {
+      "id": "system_query",
+      "label": "系统 SQLite 与加密 CSGDB 八轮中位数",
+      "path": "benchmarks/results/2026-08-02-query-performance-round3.json",
+      "query": {
+        "engine": "duckdb",
+        "sql": "SELECT m.metric, m.sqlite_median, m.csgdb_median, CASE WHEN m.metric = 'stress_reads_per_second' THEN m.candidate_delta_pct ELSE -m.candidate_delta_pct END AS improvement_pct, m.pass FROM read_json_auto('benchmarks/results/2026-08-02-query-performance-round3.json') AS r, UNNEST(r.system_comparison) AS t(m) WHERE m.category = 'query'",
+        "description": "读取系统级查询指标，并统一换算为正值更好的改善率。",
+        "executed_at": "2026-08-01T19:54:23.431243Z",
+        "language": "sql",
+        "tables_used": ["benchmarks/results/2026-08-02-query-performance-round3.json"],
+        "filters": ["category = query", "8 balanced rounds", "fresh database per invocation"],
+        "metric_definitions": [
+          "duration and latency improvement = -candidate_delta_pct",
+          "throughput improvement = candidate_delta_pct",
+          "global pass requires every measured system metric to pass"
+        ]
+      }
+    }
+  ],
+  "package_info": {
+    "originUrl": "artifact://csgdb-query-performance-round3-2026-08-02"
+  }
+}

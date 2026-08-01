@@ -330,7 +330,10 @@ impl<C> std::fmt::Debug for QueryOrder<C> {
     }
 }
 
-/// A typed query draft that cannot be executed until [`QueryDraft::take`] is called.
+/// A typed query draft that cannot be executed until it is finalized.
+///
+/// Use [`QueryDraft::take`] to materialize complete records, or
+/// [`QueryDraft::exists`] when only row existence is needed.
 pub struct QueryDraft<C> {
     predicate: Option<PredicateNode>,
     order: Vec<QueryOrder<C>>,
@@ -376,6 +379,19 @@ impl<C: Collection> QueryDraft<C> {
     /// invalid field metadata, duplicate ordering, or an excessive predicate.
     pub fn take(self, limit: u32) -> Result<CollectionQuery<C>> {
         compile_query::<C>(self.predicate.as_ref(), &self.order, limit)
+    }
+
+    /// Finalizes an existence query without materializing complete records.
+    ///
+    /// Existence is independent of row ordering. Supplying an ordering term is
+    /// rejected instead of silently discarding caller intent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::InvalidQuery`] for caller-specified ordering,
+    /// invalid field metadata, or an excessive predicate.
+    pub fn exists(self) -> Result<CollectionExistsQuery<C>> {
+        compile_exists_query::<C>(self.predicate.as_ref(), &self.order)
     }
 }
 
@@ -427,6 +443,44 @@ impl<C: Collection> std::fmt::Debug for CollectionQuery<C> {
     }
 }
 
+/// An immutable typed query that tests whether at least one row matches.
+///
+/// The query selects a constant and stops after the first match, so complete
+/// collection records are neither fetched nor decoded.
+pub struct CollectionExistsQuery<C> {
+    sql: String,
+    values: Vec<Value>,
+    marker: PhantomData<fn() -> C>,
+}
+
+impl<C: Collection> CollectionExistsQuery<C> {
+    /// Returns the collection schema targeted by this query.
+    #[must_use]
+    pub fn collection(&self) -> &'static crate::CollectionSchema {
+        C::schema()
+    }
+}
+
+impl<C> Clone for CollectionExistsQuery<C> {
+    fn clone(&self) -> Self {
+        Self {
+            sql: self.sql.clone(),
+            values: self.values.clone(),
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<C: Collection> std::fmt::Debug for CollectionExistsQuery<C> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CollectionExistsQuery")
+            .field("collection_id", &C::schema().id())
+            .field("bound_values", &self.values.len())
+            .finish_non_exhaustive()
+    }
+}
+
 /// Executes bounded typed collection queries on a compatible connection.
 pub trait CollectionQueryExecutor {
     /// Executes a finalized query and decodes at most its declared limit.
@@ -436,6 +490,20 @@ pub trait CollectionQueryExecutor {
     /// Returns an error for statement compilation, binding, execution, or row
     /// decoding failures.
     fn query_collection<C: Collection>(&self, query: &CollectionQuery<C>) -> Result<Vec<C>>;
+}
+
+/// Executes typed collection existence queries on a compatible connection.
+///
+/// This is a separate additive trait so implementations of
+/// [`CollectionQueryExecutor`] remain source compatible.
+pub trait CollectionExistsExecutor {
+    /// Returns whether at least one row matches the finalized query.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for statement compilation, binding, or execution
+    /// failures.
+    fn collection_exists<C: Collection>(&self, query: &CollectionExistsQuery<C>) -> Result<bool>;
 }
 
 impl CollectionQueryExecutor for Database {
@@ -462,6 +530,30 @@ impl CollectionQueryExecutor for ReadTransaction<'_> {
     }
 }
 
+impl CollectionExistsExecutor for Database {
+    fn collection_exists<C: Collection>(&self, query: &CollectionExistsQuery<C>) -> Result<bool> {
+        execute_exists_query(self.prepare_cached(&query.sql)?, query)
+    }
+}
+
+impl CollectionExistsExecutor for Transaction<'_> {
+    fn collection_exists<C: Collection>(&self, query: &CollectionExistsQuery<C>) -> Result<bool> {
+        execute_exists_query(self.prepare(&query.sql)?, query)
+    }
+}
+
+impl CollectionExistsExecutor for ReadConnection<'_> {
+    fn collection_exists<C: Collection>(&self, query: &CollectionExistsQuery<C>) -> Result<bool> {
+        execute_exists_query(self.prepare_cached(&query.sql)?, query)
+    }
+}
+
+impl CollectionExistsExecutor for ReadTransaction<'_> {
+    fn collection_exists<C: Collection>(&self, query: &CollectionExistsQuery<C>) -> Result<bool> {
+        execute_exists_query(self.prepare(&query.sql)?, query)
+    }
+}
+
 impl Database {
     /// Executes a finalized typed collection query.
     ///
@@ -470,6 +562,20 @@ impl Database {
     /// Returns an error for statement compilation, execution, or row decoding.
     pub fn query_collection<C: Collection>(&self, query: &CollectionQuery<C>) -> Result<Vec<C>> {
         CollectionQueryExecutor::query_collection(self, query)
+    }
+
+    /// Tests whether a finalized typed collection query has a match.
+    ///
+    /// Complete records are not fetched or decoded.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for statement compilation, binding, or execution.
+    pub fn collection_exists<C: Collection>(
+        &self,
+        query: &CollectionExistsQuery<C>,
+    ) -> Result<bool> {
+        CollectionExistsExecutor::collection_exists(self, query)
     }
 }
 
@@ -482,6 +588,19 @@ impl DatabasePool {
     pub fn query_collection<C: Collection>(&self, query: &CollectionQuery<C>) -> Result<Vec<C>> {
         self.read(|connection| connection.query_collection(query))
     }
+
+    /// Tests for a match on a pooled reader without decoding complete records.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for reader checkout, statement compilation, binding,
+    /// or execution.
+    pub fn collection_exists<C: Collection>(
+        &self,
+        query: &CollectionExistsQuery<C>,
+    ) -> Result<bool> {
+        self.read(|connection| connection.collection_exists(query))
+    }
 }
 
 impl ReadConnection<'_> {
@@ -492,6 +611,18 @@ impl ReadConnection<'_> {
     /// Returns an error for statement compilation, execution, or row decoding.
     pub fn query_collection<C: Collection>(&self, query: &CollectionQuery<C>) -> Result<Vec<C>> {
         CollectionQueryExecutor::query_collection(self, query)
+    }
+
+    /// Tests for a match on this reader without decoding complete records.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for statement compilation, binding, or execution.
+    pub fn collection_exists<C: Collection>(
+        &self,
+        query: &CollectionExistsQuery<C>,
+    ) -> Result<bool> {
+        CollectionExistsExecutor::collection_exists(self, query)
     }
 }
 
@@ -504,6 +635,46 @@ impl ReadTransaction<'_> {
     pub fn query_collection<C: Collection>(&self, query: &CollectionQuery<C>) -> Result<Vec<C>> {
         CollectionQueryExecutor::query_collection(self, query)
     }
+
+    /// Tests for a match in this snapshot without decoding complete records.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for statement compilation, binding, or execution.
+    pub fn collection_exists<C: Collection>(
+        &self,
+        query: &CollectionExistsQuery<C>,
+    ) -> Result<bool> {
+        CollectionExistsExecutor::collection_exists(self, query)
+    }
+}
+
+fn compile_exists_query<C: Collection>(
+    predicate: Option<&PredicateNode>,
+    order: &[QueryOrder<C>],
+) -> Result<CollectionExistsQuery<C>> {
+    if !order.is_empty() {
+        return Err(invalid_query());
+    }
+
+    let schema = C::schema();
+    validate_collection_schema(schema).map_err(|_| invalid_query())?;
+    let mut sql = String::from("SELECT 1 FROM ");
+    push_identifier(&mut sql, schema.table());
+
+    let mut values = Vec::new();
+    if let Some(predicate) = predicate {
+        sql.push_str(" WHERE ");
+        let mut nodes = 0;
+        compile_predicate::<C>(predicate, &mut sql, &mut values, 1, &mut nodes)?;
+    }
+    sql.push_str(" LIMIT 1");
+
+    Ok(CollectionExistsQuery {
+        sql,
+        values,
+        marker: PhantomData,
+    })
 }
 
 fn compile_query<C: Collection>(
@@ -690,14 +861,21 @@ fn execute_query<C: Collection>(
     mut statement: Statement<'_>,
     query: &CollectionQuery<C>,
 ) -> Result<Vec<C>> {
-    let references = query.values.iter().map(Value::as_ref).collect::<Vec<_>>();
-    let mut rows = statement.query(&references)?;
+    let mut rows = statement.query_values(&query.values)?;
     let capacity = usize::try_from(query.limit).map_err(|_| invalid_query())?;
     let mut records = Vec::with_capacity(capacity);
     while let Some(row) = rows.next_row()? {
         records.push(C::from_row(&row)?);
     }
     Ok(records)
+}
+
+fn execute_exists_query<C: Collection>(
+    mut statement: Statement<'_>,
+    query: &CollectionExistsQuery<C>,
+) -> Result<bool> {
+    let mut rows = statement.query_values(&query.values)?;
+    Ok(rows.next_row()?.is_some())
 }
 
 fn invalid_query() -> Error {
@@ -892,6 +1070,155 @@ mod tests {
                 .id,
             1
         );
+    }
+
+    #[test]
+    fn plaintext_exists_stops_at_a_match_without_decoding_the_record() {
+        let path = TestDatabasePath::new("plaintext-exists");
+        let mut database = Database::open_plaintext(path.path()).expect("open plaintext");
+        database
+            .register_collection::<QueryMemory>()
+            .expect("register");
+        database
+            .execute_batch(
+                "INSERT INTO query_memory(id, namespace, score, active)
+                 VALUES (1, 'malformed', 0.5, 2)",
+            )
+            .expect("insert row with an invalid bool representation");
+
+        let any = QueryMemory::query().exists().expect("unfiltered exists");
+        assert_eq!(
+            any.sql, "SELECT 1 FROM \"query_memory\" LIMIT 1",
+            "existence SQL must select only a constant and stop after one row"
+        );
+        assert_eq!(any.collection(), QueryMemory::schema());
+        assert!(database.collection_exists(&any).expect("any row"));
+
+        let malformed = QueryMemory::query()
+            .filter(
+                QueryMemory::FIELD_NAMESPACE
+                    .eq("malformed")
+                    .expect("predicate"),
+            )
+            .exists()
+            .expect("finalize exists");
+        assert_eq!(
+            malformed.sql,
+            "SELECT 1 FROM \"query_memory\" WHERE (\"namespace\" = ?) LIMIT 1"
+        );
+        assert!(database
+            .collection_exists(&malformed)
+            .expect("existence must not decode the invalid bool"));
+
+        let full_record = QueryMemory::query()
+            .filter(
+                QueryMemory::FIELD_NAMESPACE
+                    .eq("malformed")
+                    .expect("predicate"),
+            )
+            .take(1)
+            .expect("full record query");
+        assert_eq!(
+            database
+                .query_collection(&full_record)
+                .expect_err("full decoding must observe the invalid bool")
+                .code(),
+            ErrorCode::InvalidFieldValue
+        );
+
+        let missing = QueryMemory::query()
+            .filter(
+                QueryMemory::FIELD_NAMESPACE
+                    .eq("missing")
+                    .expect("predicate"),
+            )
+            .exists()
+            .expect("missing exists");
+        assert!(!database.collection_exists(&missing).expect("missing row"));
+        assert_eq!(
+            QueryMemory::query()
+                .order_by(QueryMemory::FIELD_ID.asc())
+                .exists()
+                .expect_err("existence must reject ordering")
+                .code(),
+            ErrorCode::InvalidQuery
+        );
+    }
+
+    #[test]
+    fn encrypted_exists_supports_every_read_executor_and_complex_predicates() {
+        let path = TestDatabasePath::new("encrypted-exists-executors");
+        let mut database =
+            Database::open_with_passphrase(path.path(), "exists-secret").expect("open encrypted");
+        database
+            .register_collection::<QueryMemory>()
+            .expect("register");
+        for record in [
+            memory(1, "private-session", Some(0.9), true),
+            memory(2, "private-session", Some(0.4), false),
+            memory(3, "archive", None, false),
+        ] {
+            database.insert(&record).expect("insert");
+        }
+
+        let matching = QueryMemory::query()
+            .filter(
+                QueryMemory::FIELD_NAMESPACE
+                    .eq("private-session")
+                    .expect("namespace")
+                    .and(
+                        QueryMemory::FIELD_ACTIVE
+                            .eq(true)
+                            .expect("active")
+                            .and(QueryMemory::FIELD_SCORE.ge(Some(0.8)).expect("score")),
+                    )
+                    .or(QueryMemory::FIELD_SCORE.is_null()),
+            )
+            .exists()
+            .expect("matching exists");
+        let missing = QueryMemory::query()
+            .filter(
+                QueryMemory::FIELD_NAMESPACE
+                    .eq("absent")
+                    .expect("namespace")
+                    .and(QueryMemory::FIELD_ACTIVE.eq(true).expect("active")),
+            )
+            .exists()
+            .expect("missing exists");
+        assert!(!format!("{matching:?}").contains("private-session"));
+
+        assert!(database.collection_exists(&matching).expect("database hit"));
+        assert!(!database.collection_exists(&missing).expect("database miss"));
+        {
+            let transaction = database.transaction().expect("transaction");
+            assert!(transaction
+                .collection_exists(&matching)
+                .expect("transaction hit"));
+            assert!(!transaction
+                .collection_exists(&missing)
+                .expect("transaction miss"));
+            transaction.commit().expect("commit transaction");
+        }
+        database.close().expect("close database");
+
+        let pool = DatabasePool::open_with_passphrase(
+            path.path(),
+            "exists-secret",
+            PoolOptions::default(),
+        )
+        .expect("open pool");
+        assert!(pool.collection_exists(&matching).expect("pool hit"));
+        assert!(!pool.collection_exists(&missing).expect("pool miss"));
+        pool.read(|connection| {
+            assert!(connection.collection_exists(&matching)?);
+            assert!(!connection.collection_exists(&missing)?);
+            let snapshot = connection.transaction()?;
+            assert!(snapshot.collection_exists(&matching)?);
+            assert!(!snapshot.collection_exists(&missing)?);
+            snapshot.commit()
+        })
+        .expect("reader and snapshot paths");
+        pool.close().expect("close pool");
     }
 
     #[test]

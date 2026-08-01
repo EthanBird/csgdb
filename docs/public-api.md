@@ -170,6 +170,8 @@ typedef struct csgdb_open_options {
 
 默认的 `FULLMUTEX` 允许多个线程串行使用同一个连接。显式选择 `NOMUTEX` 可以减少连接内互斥开销，但调用方必须保证同一连接及其 Statement 不会被多个线程并发调用；不同连接仍可并发工作。连接池内部遵守每个连接单一所有者的约束。
 
+Rust 中同一约束通过显式构建入口表达：`Database::builder(path).key(...).open_single_owner()` 只适合连接由一个任务持有、跨线程移动时先完成所有权移交的场景；普通 `open()` 仍保持 `FULLMUTEX`。该入口不会改变文件格式、事务隔离或加密配置。
+
 明文必须显式启用：
 
 ```c
@@ -330,10 +332,10 @@ csgdb_prepare_v2 / csgdb_prepare_v3
 csgdb_bind_parameter_count / index / name
 csgdb_bind_null / int / int64 / double / text / blob
 
-csgdb_step / reset / clear_bindings / finalize
+csgdb_step / reset / clear_bindings / reset_and_clear_bindings / finalize
 
 csgdb_column_count / name / type
-csgdb_column_int / int64 / double / text / blob / bytes
+csgdb_column_int / int64 / double / text / blob / blob_view / bytes
 
 csgdb_changes64 / total_changes64 / last_insert_rowid
 csgdb_get_autocommit / db_readonly / txn_state
@@ -353,7 +355,11 @@ csgdb_close_v2
 
 参数从 1 开始编号，结果列从 0 开始编号。UTF-8 是主文本接口；需要 UTF-16 时通过独立兼容层提供。
 
-`csgdb_bind_text` 和 `csgdb_bind_blob` 在返回前复制调用方数据。Column 返回的文本和 Blob 指针仅在当前 Row 有效；下一次 `step`、`reset` 或 `finalize` 会使其失效。Statement 到达 `DONE` 或错误状态后必须先 `reset` 才能再次执行。
+`csgdb_bind_text` 和 `csgdb_bind_blob` 在返回前复制调用方数据。Column 返回的文本和 Blob 指针仅在当前 Row 有效；下一次 `step`、`reset`、`csgdb_reset_and_clear_bindings` 或 `finalize` 会使其失效。Statement 到达 `DONE` 或错误状态后必须先 `reset` 才能再次执行。
+
+`csgdb_reset_and_clear_bindings` 先 Reset，再无条件尝试清除全部绑定，避免上一轮复制的文本或 Blob 在错误后继续驻留。Reset 若返回上一轮 `step` 的错误，Statement 仍恢复到 Ready 且绑定仍会被清除；返回值优先保留 Reset 错误，只有 Reset 成功时才返回 Clear 的结果。
+
+`csgdb_column_blob_view` 通过一次 Row/列校验同时返回 Blob 指针和 `size_t` 长度，适合逐行读取二进制数据。失败时会把调用方提供的输出清为 `NULL` 和 `0`；SQL NULL 与空 Blob 都是成功结果，长度均为 `0`，数据指针可能为 `NULL`。其数据指针的有效期与 `csgdb_column_blob` 完全相同。
 
 关闭数据库句柄时，如果还有 Statement 存活，连接关闭会延后到最后一个 Statement 完成 `finalize`。调用方仍必须对同一 Statement 的访问进行串行化。
 
@@ -412,6 +418,9 @@ tx.execute_batch("INSERT INTO memory(text) VALUES ('first memory');")?;
 tx.commit()?;
 
 assert_eq!(db.query_i64("SELECT count(*) FROM memory")?, 1);
+
+// 对会反复执行的一小组固定 SQL，显式复用预编译语句。
+assert_eq!(db.query_i64_cached("SELECT count(*) FROM memory")?, 1);
 ```
 
 ### 8.1 类型化 Collection 与 CRUD
@@ -541,6 +550,11 @@ let query = Memory::query()
     .take(24)?;
 
 let memories = db.query_collection(&query)?;
+
+let has_high_score = Memory::query()
+    .filter(Memory::FIELD_SCORE.ge(Some(0.8))?)
+    .exists()?;
+assert!(db.collection_exists(&has_high_score)?);
 # Ok::<(), csgdb::Error>(())
 ```
 
@@ -549,12 +563,12 @@ let memories = db.query_collection(&query)?;
 - SQL/Statement 接口继续作为完整的底层能力，不受类型化 API 限制；
 - 类型化查询只使用稳定 Schema 字段，不接受表名、列名或 SQL 片段输入；
 - 所有比较值都参数绑定，`CollectionQuery` 拥有这些值并可安全复用；
-- `take` 是从草稿到可执行计划的强制步骤，当前最大 10,000 行；
+- `take` 将草稿固化为完整记录查询，当前最大 10,000 行；`exists` 则固化为只取常量并在首个匹配处停止的存在性查询；
 - 默认主键排序确保相同快照上的结果顺序可重复；
 - `Database`、`DatabasePool`、`ReadConnection` 和 `ReadTransaction` 有同名便捷方法；
 - 显式 `Transaction` 通过 `CollectionQueryExecutor` trait 使用相同接口。
 
-比较操作包括 `eq/ne/lt/le/gt/ge`，可空字段另有 `is_null/is_not_null`；谓词可以使用 `and/or/not` 组合。构建阶段限制谓词节点、深度和排序字段数，并拒绝伪造字段元数据、重复排序和非法 `NULL` 大小比较。`Predicate` 不实现 `Debug`，`CollectionQuery` 的调试输出不包含绑定值。
+比较操作包括 `eq/ne/lt/le/gt/ge`，可空字段另有 `is_null/is_not_null`；谓词可以使用 `and/or/not` 组合。构建阶段限制谓词节点、深度和排序字段数，并拒绝伪造字段元数据、重复排序和非法 `NULL` 大小比较。存在性与排序无关，因此 `exists` 会明确拒绝带排序的草稿，而不是静默忽略调用方意图。`Predicate` 不实现 `Debug`，`CollectionQuery` 与 `CollectionExistsQuery` 的调试输出都不包含绑定值。
 
 这一层当前返回有界 `Vec<C>`。面向大型结果的主键游标与流式 API 会在保持硬预算的前提下单独加入。
 
@@ -675,7 +689,9 @@ while let Some(row) = rows.next_row()? {
 
 `Value` 是拥有所有权的动态值，`ValueRef` 用于低开销绑定或借用当前行。严格 getter 不做跨类型隐式转换；例如对 TEXT 调用 `get_i64` 会返回 `InvalidColumnType`。
 
-`prepare_cached` 使用连接本地、有容量上限的 LRU Cache，默认最多保留 16 条闲置语句；`set_prepared_statement_cache_capacity` 可调整上限，`flush_prepared_statement_cache` 可立即清空。`prepare` 则总是直接编译。线程和生命周期约束由 Rust 类型系统表达：
+`prepare_cached` 使用连接本地、有容量上限的 LRU Cache，默认最多保留 16 条闲置语句；`query_i64_cached` 是同一策略的标量查询便捷入口。它们适合反复执行的一小组固定 SQL。一次性或高基数 SQL 应使用 `prepare`/`query_i64`，参数化热点则应长期持有一个 `Statement`，避免缓存准入和逐出抖动。`set_prepared_statement_cache_capacity` 可调整上限，`flush_prepared_statement_cache` 可立即清空。线程和生命周期约束由 Rust 类型系统表达：
+
+当前性能门只批准固定 SQL 场景：显式缓存同时改善吞吐、p50/p95/p99 和峰值 RSS。16 条热 SQL 的 RSS 中位数仍有轻微回退，17 条 SQL 会超过默认容量并触发 LRU 抖动；因此 `query_i64_cached` 不会被普通 `query_i64` 隐式启用，调用方必须根据可证明的热集边界选择它。
 
 ```text
 Statement<'db>: 不能比 Database 存活更久

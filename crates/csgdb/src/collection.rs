@@ -780,22 +780,22 @@ impl CollectionCrud for Database {
 impl CollectionCrud for Transaction<'_> {
     fn insert<C: Collection>(&self, record: &C) -> Result<usize> {
         let values = record.values()?;
-        execute_record(self.prepare(C::INSERT_SQL)?, &values)
+        execute_record(self.prepare_cached(C::INSERT_SQL)?, &values)
     }
 
     fn get<C: Collection>(&self, key: &C::Key) -> Result<Option<C>> {
         let key = key.to_value()?;
-        query_record(self.prepare(C::SELECT_BY_KEY_SQL)?, &key)
+        query_record(self.prepare_cached(C::SELECT_BY_KEY_SQL)?, &key)
     }
 
     fn update<C: Collection>(&self, record: &C) -> Result<usize> {
         let values = update_values(record)?;
-        execute_record(self.prepare(C::UPDATE_SQL)?, &values)
+        execute_record(self.prepare_cached(C::UPDATE_SQL)?, &values)
     }
 
     fn delete<C: Collection>(&self, key: &C::Key) -> Result<usize> {
         let values = [key.to_value()?];
-        execute_record(self.prepare(C::DELETE_BY_KEY_SQL)?, &values)
+        execute_record(self.prepare_cached(C::DELETE_BY_KEY_SQL)?, &values)
     }
 }
 
@@ -1062,13 +1062,12 @@ impl ReadTransaction<'_> {
     /// Returns an error for conversion, decoding, or storage failures.
     pub fn get<C: Collection>(&self, key: &C::Key) -> Result<Option<C>> {
         let key = key.to_value()?;
-        query_record(self.prepare(C::SELECT_BY_KEY_SQL)?, &key)
+        query_record(self.prepare_cached(C::SELECT_BY_KEY_SQL)?, &key)
     }
 }
 
 fn execute_record(mut statement: Statement<'_>, values: &[Value]) -> Result<usize> {
-    let references = values.iter().map(Value::as_ref).collect::<Vec<_>>();
-    statement.execute(&references)
+    statement.execute_values(values)
 }
 
 fn query_record<C: Collection>(mut statement: Statement<'_>, key: &Value) -> Result<Option<C>> {

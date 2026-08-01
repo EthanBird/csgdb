@@ -209,6 +209,7 @@ CSGDB_API int32_t csgdb_bind_blob(
 CSGDB_API int32_t csgdb_step(csgdb_stmt *statement);
 CSGDB_API int32_t csgdb_reset(csgdb_stmt *statement);
 CSGDB_API int32_t csgdb_clear_bindings(csgdb_stmt *statement);
+CSGDB_API int32_t csgdb_reset_and_clear_bindings(csgdb_stmt *statement);
 CSGDB_API int32_t csgdb_column_count(const csgdb_stmt *statement);
 CSGDB_API const char *csgdb_column_name(
     const csgdb_stmt *statement,
@@ -237,6 +238,12 @@ CSGDB_API const unsigned char *csgdb_column_text(
 CSGDB_API const void *csgdb_column_blob(
     const csgdb_stmt *statement,
     int32_t index
+);
+CSGDB_API int32_t csgdb_column_blob_view(
+    const csgdb_stmt *statement,
+    int32_t index,
+    const void **out_data,
+    size_t *out_len
 );
 CSGDB_API int32_t csgdb_column_bytes(
     const csgdb_stmt *statement,

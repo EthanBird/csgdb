@@ -72,6 +72,9 @@ extern const char *sqlite3_libversion(void);
 #ifndef CSGDB_BENCH_MUTEX_FLAG
 #define CSGDB_BENCH_MUTEX_FLAG CSGDB_OPEN_FULLMUTEX
 #endif
+#ifndef CSGDB_BENCH_FUSED_FFI
+#define CSGDB_BENCH_FUSED_FFI 0
+#endif
 
 typedef enum engine_kind {
     ENGINE_SQLITE,
@@ -134,6 +137,7 @@ typedef struct benchmark_result {
     double range_scan_ms;
     double update_ms;
     uint64_t range_rows;
+    uint64_t deterministic_checksum;
     uint64_t checksum;
     double stress_seconds;
     uint64_t stress_reads;
@@ -150,6 +154,18 @@ typedef struct benchmark_result {
     uint64_t max_rss_kib;
     int integrity_ok;
 } benchmark_result;
+
+typedef struct read_stress_result {
+    double elapsed_seconds;
+    uint64_t reads;
+    uint64_t errors;
+    uint64_t checksum;
+    double p50_us;
+    double p95_us;
+    double p99_us;
+    uint64_t max_rss_kib;
+    int integrity_ok;
+} read_stress_result;
 
 static const uint8_t DATABASE_KEY[32] = {
     0x63, 0x73, 0x67, 0x64, 0x62, 0x2d, 0x62, 0x65,
@@ -296,11 +312,15 @@ static int statement_reset(statement_handle *statement) {
         }
         return result;
     }
+#if CSGDB_BENCH_FUSED_FFI
+    return csgdb_reset_and_clear_bindings(statement->csgdb);
+#else
     result = csgdb_reset(statement->csgdb);
     if (result == CSGDB_OK) {
         result = csgdb_clear_bindings(statement->csgdb);
     }
     return result;
+#endif
 }
 
 static int statement_bind_i64(statement_handle *statement, int index, int64_t value) {
@@ -364,6 +384,62 @@ static int statement_column_bytes(statement_handle *statement, int column) {
         return sqlite3_column_bytes(statement->sqlite, column);
     }
     return csgdb_column_bytes(statement->csgdb, column);
+}
+
+static const void *statement_column_blob(statement_handle *statement, int column) {
+    if (statement->engine == ENGINE_SQLITE) {
+        return sqlite3_column_blob(statement->sqlite, column);
+    }
+    return csgdb_column_blob(statement->csgdb, column);
+}
+
+static int statement_consume_blob(
+    statement_handle *statement,
+    int column,
+    uint64_t *checksum
+) {
+#if CSGDB_BENCH_FUSED_FFI
+    if (statement->engine != ENGINE_SQLITE) {
+        const void *raw_blob = NULL;
+        size_t length = 0;
+        int result = csgdb_column_blob_view(
+            statement->csgdb,
+            column,
+            &raw_blob,
+            &length
+        );
+        const uint8_t *blob = raw_blob;
+        if (result != CSGDB_OK || (length > 0 && blob == NULL)) {
+            return 0;
+        }
+
+        uint64_t contribution = (uint64_t)length;
+        if (length > 0) {
+            contribution += (uint64_t)blob[0];
+            contribution += (uint64_t)blob[length / 3U] << 8;
+            contribution += (uint64_t)blob[(length * 2U) / 3U] << 16;
+            contribution += (uint64_t)blob[length - 1U] << 24;
+        }
+        *checksum += contribution;
+        return 1;
+    }
+#endif
+    const uint8_t *blob = statement_column_blob(statement, column);
+    int bytes = statement_column_bytes(statement, column);
+    if (bytes < 0 || (bytes > 0 && blob == NULL)) {
+        return 0;
+    }
+
+    uint64_t contribution = (uint64_t)bytes;
+    if (bytes > 0) {
+        size_t length = (size_t)bytes;
+        contribution += (uint64_t)blob[0];
+        contribution += (uint64_t)blob[length / 3U] << 8;
+        contribution += (uint64_t)blob[(length * 2U) / 3U] << 16;
+        contribution += (uint64_t)blob[length - 1U] << 24;
+    }
+    *checksum += contribution;
+    return 1;
 }
 
 static const unsigned char *statement_column_text(statement_handle *statement, int column) {
@@ -585,7 +661,12 @@ static int run_point_reads(
             return 0;
         }
         sum += (uint64_t)(statement_column_double(&statement, 0) * 1000000.0);
-        sum += (uint64_t)statement_column_bytes(&statement, 1);
+        if (!statement_consume_blob(&statement, 1, &sum)) {
+            fprintf(stderr, "%s: point read returned an invalid blob: %s\n",
+                engine_name(database->engine), database_error(database));
+            statement_finalize(&statement);
+            return 0;
+        }
         if (statement_step(&statement) != SQLITE_DONE_LOCAL ||
             statement_reset(&statement) != SQLITE_OK_LOCAL) {
             fprintf(stderr, "%s: point read reset failed: %s\n",
@@ -635,7 +716,12 @@ static int run_range_scans(
         int result;
         while ((result = statement_step(&statement)) == SQLITE_ROW_LOCAL) {
             sum += (uint64_t)statement_column_i64(&statement, 0);
-            sum += (uint64_t)statement_column_bytes(&statement, 1);
+            if (!statement_consume_blob(&statement, 1, &sum)) {
+                fprintf(stderr, "%s: range scan returned an invalid blob: %s\n",
+                    engine_name(database->engine), database_error(database));
+                statement_finalize(&statement);
+                return 0;
+            }
             ++count;
         }
         if (result != SQLITE_DONE_LOCAL || statement_reset(&statement) != SQLITE_OK_LOCAL) {
@@ -754,8 +840,11 @@ static void *reader_main(void *raw_context) {
         if (result == SQLITE_ROW_LOCAL) {
             context->checksum +=
                 (uint64_t)(statement_column_double(&statement, 0) * 1000000.0);
-            context->checksum += (uint64_t)statement_column_bytes(&statement, 1);
-            result = statement_step(&statement);
+            if (statement_consume_blob(&statement, 1, &context->checksum)) {
+                result = statement_step(&statement);
+            } else {
+                result = -1;
+            }
         }
         if (result == SQLITE_DONE_LOCAL && statement_reset(&statement) == SQLITE_OK_LOCAL) {
             ++context->operations;
@@ -914,6 +1003,117 @@ static int run_stress(
     return 1;
 }
 
+static int run_read_stress(
+    engine_kind engine,
+    const char *path,
+    uint64_t row_count,
+    unsigned seconds,
+    read_stress_result *result
+) {
+    reader_context readers[READER_THREADS];
+    pthread_t reader_threads[READER_THREADS];
+    stress_control control;
+    size_t initialized_readers = 0;
+    size_t started_readers = 0;
+    int success = 0;
+
+    memset(readers, 0, sizeof(readers));
+    memset(result, 0, sizeof(*result));
+    atomic_init(&control.start, 0);
+    atomic_init(&control.stop, 0);
+
+    for (size_t index = 0; index < READER_THREADS; ++index) {
+        readers[index].control = &control;
+        readers[index].seed = 0x243f6a8885a308d3ULL ^ ((uint64_t)index << 32);
+        readers[index].row_count = row_count;
+        if (database_open(&readers[index].database, engine, path) != SQLITE_OK_LOCAL) {
+            fprintf(stderr, "%s: could not open read-stress reader: %s\n",
+                engine_name(engine), database_error(&readers[index].database));
+            goto cleanup;
+        }
+        if (!samples_initialize(&readers[index].samples, READER_SAMPLE_CAPACITY)) {
+            fprintf(stderr, "%s: could not allocate read-stress samples\n",
+                engine_name(engine));
+            database_close(&readers[index].database);
+            goto cleanup;
+        }
+        ++initialized_readers;
+    }
+
+    for (size_t index = 0; index < READER_THREADS; ++index) {
+        if (pthread_create(&reader_threads[index], NULL, reader_main, &readers[index]) != 0) {
+            fprintf(stderr, "%s: could not create read-stress reader thread\n",
+                engine_name(engine));
+            atomic_store_explicit(&control.start, 1, memory_order_release);
+            atomic_store_explicit(&control.stop, 1, memory_order_release);
+            goto join_started_readers;
+        }
+        ++started_readers;
+    }
+
+    {
+        uint64_t start = monotonic_ns();
+        atomic_store_explicit(&control.start, 1, memory_order_release);
+        struct timespec duration = {.tv_sec = (time_t)seconds, .tv_nsec = 0};
+        while (nanosleep(&duration, &duration) != 0) {
+        }
+        atomic_store_explicit(&control.stop, 1, memory_order_release);
+        for (size_t index = 0; index < started_readers; ++index) {
+            pthread_join(reader_threads[index], NULL);
+        }
+        started_readers = 0;
+        result->elapsed_seconds = (double)(monotonic_ns() - start) / 1000000000.0;
+    }
+
+    {
+        size_t combined_capacity = 0;
+        latency_samples combined;
+        memset(&combined, 0, sizeof(combined));
+        for (size_t index = 0; index < READER_THREADS; ++index) {
+            combined_capacity += readers[index].samples.length;
+        }
+        if (combined_capacity > 0 && !samples_initialize(&combined, combined_capacity)) {
+            fprintf(stderr, "%s: could not combine read-stress samples\n",
+                engine_name(engine));
+            goto cleanup;
+        }
+        for (size_t index = 0; index < READER_THREADS; ++index) {
+            if (readers[index].samples.length > 0) {
+                memcpy(
+                    combined.values + combined.length,
+                    readers[index].samples.values,
+                    readers[index].samples.length * sizeof(*combined.values)
+                );
+            }
+            combined.length += readers[index].samples.length;
+            result->reads += readers[index].operations;
+            result->errors += readers[index].errors;
+            result->checksum += readers[index].checksum;
+        }
+        result->p50_us = samples_percentile(&combined, 0.50);
+        result->p95_us = samples_percentile(&combined, 0.95);
+        result->p99_us = samples_percentile(&combined, 0.99);
+        samples_free(&combined);
+    }
+    success = 1;
+    goto cleanup;
+
+join_started_readers:
+    for (size_t index = 0; index < started_readers; ++index) {
+        pthread_join(reader_threads[index], NULL);
+    }
+    started_readers = 0;
+
+cleanup:
+    for (size_t index = 0; index < initialized_readers; ++index) {
+        samples_free(&readers[index].samples);
+        if (database_close(&readers[index].database) != SQLITE_OK_LOCAL) {
+            success = 0;
+        }
+    }
+    return success;
+}
+
 static uint64_t database_size(const char *path) {
     struct stat details;
     if (stat(path, &details) != 0 || details.st_size < 0) {
@@ -976,7 +1176,8 @@ static void print_result(
         "\"read_p50_us\":%.3f,\"read_p95_us\":%.3f,\"read_p99_us\":%.3f,"
         "\"commit_p50_us\":%.3f,\"commit_p95_us\":%.3f,"
         "\"commit_p99_us\":%.3f,\"database_bytes\":%llu,"
-        "\"max_rss_kib\":%llu,\"integrity_ok\":%s,\"checksum\":%llu}\n",
+        "\"max_rss_kib\":%llu,\"integrity_ok\":%s,"
+        "\"deterministic_checksum\":%llu,\"checksum\":%llu}\n",
         engine_name(engine),
         result->engine_sqlite_version,
         sqlite3_libversion(),
@@ -1008,7 +1209,35 @@ static void print_result(
         (unsigned long long)result->database_bytes,
         (unsigned long long)result->max_rss_kib,
         result->integrity_ok ? "true" : "false",
+        (unsigned long long)result->deterministic_checksum,
         (unsigned long long)result->checksum
+    );
+}
+
+static void print_read_stress_result(
+    engine_kind engine,
+    uint64_t row_count,
+    unsigned requested_seconds,
+    const read_stress_result *result
+) {
+    printf(
+        "{\"mode\":\"read-stress\",\"engine\":\"%s\",\"rows\":%llu,"
+        "\"requested_seconds\":%u,\"elapsed_seconds\":%.3f,"
+        "\"reads\":%llu,\"errors\":%llu,"
+        "\"p50_us\":%.3f,\"p95_us\":%.3f,\"p99_us\":%.3f,"
+        "\"checksum\":%llu,\"max_rss_kib\":%llu,\"integrity_ok\":%s}\n",
+        engine_name(engine),
+        (unsigned long long)row_count,
+        requested_seconds,
+        result->elapsed_seconds,
+        (unsigned long long)result->reads,
+        (unsigned long long)result->errors,
+        result->p50_us,
+        result->p95_us,
+        result->p99_us,
+        (unsigned long long)result->checksum,
+        (unsigned long long)result->max_rss_kib,
+        result->integrity_ok ? "true" : "false"
     );
 }
 
@@ -1036,12 +1265,53 @@ int main(int argc, char **argv) {
         );
         return ok ? 0 : 1;
     }
+    if (argc == 6 && strcmp(argv[1], "read-stress") == 0) {
+        engine_kind read_engine;
+        struct stat details;
+        uint64_t rows = strtoull(argv[4], NULL, 10);
+        uint64_t seconds_value = strtoull(argv[5], NULL, 10);
+        if (!parse_engine(argv[2], &read_engine) || stat(argv[3], &details) != 0 ||
+            rows == 0 || rows > 10000000 || seconds_value == 0 ||
+            seconds_value > UINT32_MAX) {
+            fprintf(
+                stderr,
+                "usage: %s read-stress ENGINE EXISTING_DATABASE.db ROWS SECONDS\n",
+                argv[0]
+            );
+            return 2;
+        }
+
+        unsigned seconds = (unsigned)seconds_value;
+        read_stress_result result;
+        if (!run_read_stress(read_engine, argv[3], rows, seconds, &result)) {
+            return 1;
+        }
+
+        database_handle integrity_database;
+        if (database_open(&integrity_database, read_engine, argv[3]) != SQLITE_OK_LOCAL) {
+            fprintf(stderr, "%s: read-stress integrity open failed: %s\n",
+                engine_name(read_engine), database_error(&integrity_database));
+            return 1;
+        }
+        result.integrity_ok = verify_integrity(&integrity_database);
+        if (database_close(&integrity_database) != SQLITE_OK_LOCAL) {
+            result.integrity_ok = 0;
+        }
+        struct rusage usage;
+        if (getrusage(RUSAGE_SELF, &usage) == 0 && usage.ru_maxrss > 0) {
+            result.max_rss_kib = (uint64_t)usage.ru_maxrss;
+        }
+        print_read_stress_result(read_engine, rows, seconds, &result);
+        return result.integrity_ok && result.errors == 0 ? 0 : 1;
+    }
     if (argc != 9) {
         fprintf(
             stderr,
             "usage: %s ENGINE DATABASE.db ROWS POINT_READS RANGE_SCANS UPDATES "
             "DURABLE_WRITES STRESS_SECONDS\n"
-            "       %s verify ENGINE EXISTING_DATABASE.db\n",
+            "       %s verify ENGINE EXISTING_DATABASE.db\n"
+            "       %s read-stress ENGINE EXISTING_DATABASE.db ROWS SECONDS\n",
+            argv[0],
             argv[0],
             argv[0]
         );
@@ -1097,8 +1367,11 @@ int main(int argc, char **argv) {
             &result.range_scan_ms,
             &result.range_rows,
             &result.checksum
-        ) ||
-        !run_updates(&database, rows, update_operations, &result.update_ms) ||
+        )) {
+        return 1;
+    }
+    result.deterministic_checksum = result.checksum;
+    if (!run_updates(&database, rows, update_operations, &result.update_ms) ||
         !expect_ok(&database, database_close(&database), "close before stress") ||
         !run_stress(engine, path, rows, stress_seconds, &result) ||
         database_open(&database, engine, path) != SQLITE_OK_LOCAL ||

@@ -93,7 +93,20 @@ int main(int argc, char **argv) {
         csgdb_finalize(statement);
         return fail(db, "prepare select", csgdb_errcode(db));
     }
-    if (csgdb_step(statement) != CSGDB_ROW ||
+    if (csgdb_step(statement) != CSGDB_ROW) {
+        csgdb_finalize(statement);
+        return fail(db, "step select", csgdb_errcode(db));
+    }
+    const void *blob_view = (const void *)(uintptr_t)1;
+    size_t blob_view_len = SIZE_MAX;
+    rc = csgdb_column_blob_view(statement, 3, &blob_view, &blob_view_len);
+    if (rc != CSGDB_RANGE || blob_view != NULL || blob_view_len != 0) {
+        csgdb_finalize(statement);
+        return fail(db, "invalid blob view", rc);
+    }
+    rc = csgdb_column_blob_view(statement, 2, &blob_view, &blob_view_len);
+    if (rc != CSGDB_OK || blob_view_len != sizeof(payload) ||
+        memcmp(blob_view, payload, sizeof(payload)) != 0 ||
         csgdb_column_count(statement) != 3 ||
         csgdb_column_type(statement, 0) != CSGDB_INTEGER ||
         csgdb_column_int64(statement, 0) != 7 ||
@@ -106,6 +119,21 @@ int main(int argc, char **argv) {
         csgdb_step(statement) != CSGDB_DONE) {
         csgdb_finalize(statement);
         return fail(db, "select", csgdb_errcode(db));
+    }
+    rc = csgdb_reset_and_clear_bindings(statement);
+    if (rc != CSGDB_OK) {
+        csgdb_finalize(statement);
+        return fail(db, "fused reset", rc);
+    }
+    rc = csgdb_step(statement);
+    if (rc != CSGDB_DONE) {
+        csgdb_finalize(statement);
+        return fail(db, "cleared binding", rc);
+    }
+    rc = csgdb_reset_and_clear_bindings(statement);
+    if (rc != CSGDB_OK) {
+        csgdb_finalize(statement);
+        return fail(db, "second fused reset", rc);
     }
     rc = csgdb_finalize(statement);
     if (rc != CSGDB_OK) {

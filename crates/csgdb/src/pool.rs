@@ -927,6 +927,15 @@ impl<'connection> ReadConnection<'connection> {
         self.database.query_i64(sql)
     }
 
+    /// Reads one integer through this reader's bounded statement cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the query fails.
+    pub fn query_i64_cached(&self, sql: &str) -> Result<i64> {
+        self.database.query_i64_cached(sql)
+    }
+
     /// Compiles a statement on the read-only connection.
     ///
     /// # Errors
@@ -999,6 +1008,16 @@ impl ReadTransaction<'_> {
         self.inner.query_i64(sql)
     }
 
+    /// Reads one integer through the connection-local statement cache while
+    /// retaining the current read snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the query fails.
+    pub fn query_i64_cached(&self, sql: &str) -> Result<i64> {
+        self.inner.query_i64_cached(sql)
+    }
+
     /// Compiles a statement in the transaction snapshot.
     ///
     /// # Errors
@@ -1006,6 +1025,16 @@ impl ReadTransaction<'_> {
     /// Returns an error when the SQL cannot be compiled.
     pub fn prepare(&self, sql: &str) -> Result<Statement<'_>> {
         self.inner.prepare(sql)
+    }
+
+    /// Compiles a statement through the connection-local LRU cache while
+    /// retaining the current read snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the SQL cannot be compiled.
+    pub fn prepare_cached(&self, sql: &str) -> Result<Statement<'_>> {
+        self.inner.prepare_cached(sql)
     }
 
     /// Returns current transaction activity.
@@ -1609,12 +1638,7 @@ fn execute_group_job(
     transaction.execute_batch(SAVEPOINT)?;
     let mut changes = Vec::with_capacity(statements.len());
     for statement in statements {
-        let parameters = statement
-            .parameters
-            .iter()
-            .map(Value::as_ref)
-            .collect::<Vec<_>>();
-        match transaction.execute(&statement.sql, &parameters) {
+        match transaction.execute_values(&statement.sql, &statement.parameters) {
             Ok(statement_changes) => changes.push(statement_changes),
             Err(error) => {
                 transaction.execute_batch(ROLLBACK)?;

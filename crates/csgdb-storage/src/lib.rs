@@ -412,15 +412,35 @@ impl Connection {
         unsafe { self.inner.handle().cast() }
     }
 
-    /// Reads a single integer value.
+    /// Reads the first column of the first result row as an integer.
     ///
     /// # Errors
     ///
-    /// Returns an error when preparation, execution, conversion, or row
-    /// cardinality validation fails.
+    /// Returns an error when preparation, execution, or conversion fails, or
+    /// when the query returns no rows. Additional rows are not inspected.
     pub fn query_i64(&self, sql: &str) -> Result<i64> {
         self.inner
             .query_row(sql, [], |row| row.get(0))
+            .map_err(|error| map_storage_error(&error))
+    }
+
+    /// Reads the first integer through the bounded prepared-statement cache.
+    ///
+    /// Prefer this explicit variant only when the same small set of SQL text
+    /// is reused. [`Self::query_i64`] avoids cache-admission overhead for
+    /// one-shot and high-cardinality SQL.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when preparation, execution, or conversion fails, or
+    /// when the query returns no rows. Additional rows are not inspected.
+    pub fn query_i64_cached(&self, sql: &str) -> Result<i64> {
+        let mut statement = self
+            .inner
+            .prepare_cached(sql)
+            .map_err(|error| map_storage_error(&error))?;
+        statement
+            .query_row([], |row| row.get(0))
             .map_err(|error| map_storage_error(&error))
     }
 
@@ -486,15 +506,32 @@ impl Transaction<'_> {
             .map_err(|error| map_storage_error(&error))
     }
 
-    /// Reads a single integer value inside the transaction.
+    /// Reads the first column of the first result row inside the transaction.
     ///
     /// # Errors
     ///
-    /// Returns an error when preparation, execution, conversion, or row
-    /// cardinality validation fails.
+    /// Returns an error when preparation, execution, or conversion fails, or
+    /// when the query returns no rows. Additional rows are not inspected.
     pub fn query_i64(&self, sql: &str) -> Result<i64> {
         self.inner
             .query_row(sql, [], |row| row.get(0))
+            .map_err(|error| map_storage_error(&error))
+    }
+
+    /// Reads the first integer through the connection-local statement cache
+    /// while retaining the current transaction snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when preparation, execution, or conversion fails, or
+    /// when the query returns no rows. Additional rows are not inspected.
+    pub fn query_i64_cached(&self, sql: &str) -> Result<i64> {
+        let mut statement = self
+            .inner
+            .prepare_cached(sql)
+            .map_err(|error| map_storage_error(&error))?;
+        statement
+            .query_row([], |row| row.get(0))
             .map_err(|error| map_storage_error(&error))
     }
 
@@ -505,6 +542,13 @@ impl Transaction<'_> {
     /// Returns an error when compilation, binding, or execution fails.
     pub fn execute(&self, sql: &str, parameters: &[ValueRef<'_>]) -> Result<usize> {
         self.prepare(sql)?.execute(parameters)
+    }
+
+    /// Executes one statement from owned parameter values without building an
+    /// intermediate borrowed-value vector.
+    #[doc(hidden)]
+    pub fn execute_values(&self, sql: &str, parameters: &[Value]) -> Result<usize> {
+        self.prepare(sql)?.execute_values(parameters)
     }
 
     /// Compiles a SQL statement scoped to this transaction.
@@ -518,6 +562,25 @@ impl Transaction<'_> {
             .prepare(sql)
             .map_err(|error| map_storage_error(&error))?;
         Ok(Statement::direct(inner))
+    }
+
+    /// Compiles a transaction-scoped statement through the connection's
+    /// bounded LRU cache.
+    ///
+    /// Dropping the statement resets it and returns it to the same
+    /// connection-local cache used outside the transaction. This is intended
+    /// for SQL text that the caller knows will be reused; one-shot or highly
+    /// variable SQL should continue to use [`Self::prepare`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the SQL cannot be compiled.
+    pub fn prepare_cached(&self, sql: &str) -> Result<Statement<'_>> {
+        let inner = self
+            .inner
+            .prepare_cached(sql)
+            .map_err(|error| map_storage_error(&error))?;
+        Ok(Statement::cached(inner))
     }
 
     /// Returns the transaction activity for one database, or the highest
@@ -648,6 +711,16 @@ impl<'connection> Statement<'connection> {
             .map_err(|error| map_storage_error(&error))
     }
 
+    /// Executes this statement from owned values without allocating a second
+    /// vector for borrowed parameter views.
+    #[doc(hidden)]
+    pub fn execute_values(&mut self, parameters: &[Value]) -> Result<usize> {
+        self.bind_owned_all(parameters)?;
+        self.inner_mut()
+            .raw_execute()
+            .map_err(|error| map_storage_error(&error))
+    }
+
     /// Starts a streaming query with an exact positional parameter list.
     ///
     /// Only the current row is borrowed from the engine at a time. Calling
@@ -666,12 +739,36 @@ impl<'connection> Statement<'connection> {
         })
     }
 
+    /// Starts a query from owned values without allocating a second vector
+    /// for borrowed parameter views.
+    #[doc(hidden)]
+    pub fn query_values<'statement>(
+        &'statement mut self,
+        parameters: &[Value],
+    ) -> Result<Rows<'statement>> {
+        self.bind_owned_all(parameters)?;
+        Ok(Rows {
+            inner: self.inner_mut().raw_query(),
+        })
+    }
+
     /// Removes all parameter bindings.
     pub fn clear_bindings(&mut self) {
         self.inner_mut().clear_bindings();
     }
 
     fn bind_all(&mut self, parameters: &[ValueRef<'_>]) -> Result<()> {
+        self.bind_iter(parameters.iter().copied())
+    }
+
+    fn bind_owned_all(&mut self, parameters: &[Value]) -> Result<()> {
+        self.bind_iter(parameters.iter().map(Value::as_ref))
+    }
+
+    fn bind_iter<'value>(
+        &mut self,
+        parameters: impl ExactSizeIterator<Item = ValueRef<'value>>,
+    ) -> Result<()> {
         let expected = self.parameter_count();
         if parameters.len() != expected {
             return Err(Error::new(
@@ -680,19 +777,20 @@ impl<'connection> Statement<'connection> {
             ));
         }
 
-        self.clear_bindings();
-        for (offset, value) in parameters.iter().copied().enumerate() {
+        let inner = self.inner_mut();
+        for (offset, value) in parameters.enumerate() {
             let index = offset + 1;
             let result = match value {
-                ValueRef::Null => self
-                    .inner_mut()
-                    .raw_bind_parameter(index, rusqlite::types::Null),
-                ValueRef::Integer(value) => self.inner_mut().raw_bind_parameter(index, value),
-                ValueRef::Real(value) => self.inner_mut().raw_bind_parameter(index, value),
-                ValueRef::Text(value) => self.inner_mut().raw_bind_parameter(index, value),
-                ValueRef::Blob(value) => self.inner_mut().raw_bind_parameter(index, value),
+                ValueRef::Null => inner.raw_bind_parameter(index, rusqlite::types::Null),
+                ValueRef::Integer(value) => inner.raw_bind_parameter(index, value),
+                ValueRef::Real(value) => inner.raw_bind_parameter(index, value),
+                ValueRef::Text(value) => inner.raw_bind_parameter(index, value),
+                ValueRef::Blob(value) => inner.raw_bind_parameter(index, value),
             };
-            result.map_err(|error| map_storage_error(&error))?;
+            if let Err(error) = result {
+                inner.clear_bindings();
+                return Err(map_storage_error(&error));
+            }
         }
         Ok(())
     }
@@ -1135,7 +1233,7 @@ pub const fn plaintext_header() -> &'static [u8; 16] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use csgdb_core::{prepare_open, KeySource, OpenOptions, SecretKey};
+    use csgdb_core::{prepare_open, KeySource, OpenFlags, OpenOptions, SecretKey};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1183,6 +1281,20 @@ mod tests {
             .expect("resolve key")
     }
 
+    fn plaintext_plan(path: &Path) -> ResolvedOpenPlan {
+        let options = OpenOptions {
+            flags: OpenFlags::READWRITE
+                | OpenFlags::CREATE
+                | OpenFlags::PLAINTEXT
+                | OpenFlags::FULLMUTEX,
+            ..OpenOptions::default()
+        };
+        prepare_open(path, options)
+            .expect("prepare plaintext open")
+            .resolve_key()
+            .expect("resolve plaintext plan")
+    }
+
     #[test]
     fn optimized_hmac_matches_the_rfc_sha256_vector() {
         // SAFETY: the linked helper takes no pointers and only operates on
@@ -1195,6 +1307,76 @@ mod tests {
         // SAFETY: the linked helper takes no pointers and only operates on
         // fixed test vectors in its own stack storage.
         assert_eq!(unsafe { _csgdb_internal_hmac_legacy_self_test() }, 1);
+    }
+
+    #[test]
+    fn statement_binding_overwrites_every_slot_and_recovers_from_count_errors() {
+        let path = TestDatabasePath::new("binding-overwrite");
+        let connection = Connection::open(&plaintext_plan(path.path())).expect("open database");
+        let mut statement = connection.prepare("SELECT ?, ?").expect("prepare query");
+
+        {
+            let mut rows = statement
+                .query(&[ValueRef::Text("sensitive"), ValueRef::Blob(&[1, 2, 3])])
+                .expect("bind first values");
+            let row = rows.next_row().expect("step first values").expect("row");
+            assert_eq!(row.get_text(0).expect("text"), "sensitive");
+            assert_eq!(row.get_blob(1).expect("blob"), &[1, 2, 3]);
+        }
+
+        let Err(error) = statement.query(&[ValueRef::Integer(7)]) else {
+            panic!("incomplete parameter list must fail");
+        };
+        assert_eq!(error.code(), ErrorCode::ParameterCountMismatch);
+
+        let mut rows = statement
+            .query(&[ValueRef::Null, ValueRef::Integer(9)])
+            .expect("overwrite all values");
+        let row = rows
+            .next_row()
+            .expect("step replacement values")
+            .expect("row");
+        assert_eq!(row.value_type(0).expect("null type"), ValueType::Null);
+        assert_eq!(row.get_i64(1).expect("integer"), 9);
+    }
+
+    #[test]
+    fn owned_values_bind_without_an_intermediate_vector_and_cached_transactions_reuse_safely() {
+        let path = TestDatabasePath::new("owned-binding-cache");
+        let mut connection = Connection::open(&plaintext_plan(path.path())).expect("open database");
+        connection
+            .execute_batch("CREATE TABLE item(id INTEGER PRIMARY KEY, body BLOB NOT NULL)")
+            .expect("create table");
+
+        {
+            let transaction = connection.transaction().expect("begin transaction");
+            let mut insert = transaction
+                .prepare_cached("INSERT INTO item(id, body) VALUES (?, ?)")
+                .expect("prepare cached insert");
+            assert_eq!(
+                insert
+                    .execute_values(&[Value::Integer(1), Value::Blob(vec![4, 5, 6])])
+                    .expect("execute owned values"),
+                1
+            );
+            drop(insert);
+            transaction.commit().expect("commit transaction");
+        }
+
+        {
+            let transaction = connection.transaction().expect("begin read transaction");
+            let mut query = transaction
+                .prepare_cached("SELECT body FROM item WHERE id = ?")
+                .expect("prepare cached query");
+            let mut rows = query
+                .query_values(&[Value::Integer(1)])
+                .expect("query owned value");
+            let row = rows.next_row().expect("step query").expect("row");
+            assert_eq!(row.get_blob(0).expect("blob"), &[4, 5, 6]);
+            drop(rows);
+            drop(query);
+            transaction.commit().expect("finish read transaction");
+        }
     }
 
     #[test]

@@ -1160,6 +1160,38 @@ pub unsafe extern "C" fn csgdb_clear_bindings(statement: *mut CsgdbStatement) ->
     })
 }
 
+/// Resets a statement and removes all bindings.
+///
+/// Binding removal is attempted even when reset reports the prior step's
+/// error, so copied text and blob values are not retained unnecessarily. A
+/// reset error takes precedence over a binding-clear error. The statement
+/// enters the ready state after reset in either case.
+///
+/// # Safety
+///
+/// `statement` must be a live statement handle.
+#[no_mangle]
+pub unsafe extern "C" fn csgdb_reset_and_clear_bindings(statement: *mut CsgdbStatement) -> i32 {
+    // SAFETY: the caller guarantees a null or live statement.
+    let Some(statement) = (unsafe { statement.as_ref() }) else {
+        return CSGDB_INVALID_ARGUMENT;
+    };
+    // SAFETY: the caller keeps the raw statement live. Connection-level
+    // synchronization follows the selected mutex mode.
+    let reset_result = unsafe { sqlite::sqlite3_reset(statement.raw) };
+    statement
+        .state
+        .store(StatementState::Ready as u8, Ordering::Relaxed);
+    // SAFETY: reset put the live statement in its ready state, even when it
+    // reports the previous step's error.
+    let clear_result = unsafe { sqlite::sqlite3_clear_bindings(statement.raw) };
+    if reset_result == sqlite::SQLITE_OK {
+        set_sqlite_result(&statement.database, clear_result)
+    } else {
+        statement.database.set_code(map_sqlite_code(reset_result))
+    }
+}
+
 /// Returns the number of result columns.
 ///
 /// # Safety
@@ -1309,6 +1341,67 @@ pub unsafe extern "C" fn csgdb_column_blob(
         // SAFETY: the statement lock keeps `raw` live.
         unsafe { sqlite::sqlite3_column_blob(raw, index) }
     })
+}
+
+/// Returns a borrowed blob pointer and its byte length with one validation.
+///
+/// On every failure, non-null output pointers are cleared. SQL NULL and an
+/// empty blob both succeed with a zero length and may return a null data
+/// pointer. The returned pointer follows [`csgdb_column_blob`] lifetime rules.
+///
+/// # Safety
+///
+/// `statement` must be null or a live statement handle. Non-null output
+/// pointers must be writable for their respective types.
+#[no_mangle]
+pub unsafe extern "C" fn csgdb_column_blob_view(
+    statement: *const CsgdbStatement,
+    index: c_int,
+    out_data: *mut *const c_void,
+    out_len: *mut usize,
+) -> i32 {
+    // Initialize outputs before validating the statement so callers never
+    // observe stale data after an error.
+    if !out_data.is_null() {
+        // SAFETY: the caller guarantees writable output storage.
+        unsafe { out_data.write(ptr::null()) };
+    }
+    if !out_len.is_null() {
+        // SAFETY: the caller guarantees writable output storage.
+        unsafe { out_len.write(0) };
+    }
+
+    // SAFETY: the caller guarantees a null or live statement.
+    let Some(statement) = (unsafe { statement.as_ref() }) else {
+        return CSGDB_INVALID_ARGUMENT;
+    };
+    if out_data.is_null() || out_len.is_null() {
+        return statement.database.set_code(CSGDB_INVALID_ARGUMENT);
+    }
+    if statement.raw.is_null()
+        || statement.state.load(Ordering::Relaxed) != StatementState::Row as u8
+    {
+        return statement.database.set_code(CSGDB_MISUSE);
+    }
+    if index < 0 || index >= statement.column_count {
+        return statement.database.set_code(CSGDB_RANGE);
+    }
+
+    // SAFETY: the live statement is positioned on a row and the column index
+    // is valid. Calling bytes after blob preserves the borrowed blob pointer.
+    let data = unsafe { sqlite::sqlite3_column_blob(statement.raw, index) };
+    // SAFETY: same validated statement and column as above.
+    let byte_len = unsafe { sqlite::sqlite3_column_bytes(statement.raw, index) };
+    let Ok(byte_len) = usize::try_from(byte_len) else {
+        return statement.database.set_code(CSGDB_STORAGE);
+    };
+    // SAFETY: both output pointers were validated as non-null and writable.
+    unsafe {
+        out_data.write(data);
+        out_len.write(byte_len);
+    }
+    statement.database.set_ok();
+    CSGDB_OK
 }
 
 /// Returns the byte length of the current text or blob column.
@@ -1802,6 +1895,18 @@ mod tests {
         unsafe { CStr::from_ptr((*default_vfs).zName) }.to_owned()
     }
 
+    fn database_has_engine_mutex(database: *mut CsgdbHandle) -> bool {
+        // SAFETY: tests call this only with a live handle and keep it open for
+        // the duration of the inspection.
+        let handle = unsafe { &*database };
+        let shared = handle.database.as_ref().expect("open database");
+        let connection = shared.database.lock().expect("database lock");
+        // SAFETY: the connection lock keeps the raw engine handle live.
+        let raw = unsafe { connection.as_raw_handle() }.cast();
+        // SAFETY: `raw` names the live SQLite connection inspected above.
+        !unsafe { sqlite::sqlite3_db_mutex(raw) }.is_null()
+    }
+
     #[test]
     fn default_c_options_enable_encryption() {
         let options = csgdb_open_options::default();
@@ -1814,6 +1919,20 @@ mod tests {
     fn initializer_rejects_null_pointer() {
         let result = unsafe { csgdb_open_options_init(ptr::null_mut()) };
         assert_eq!(result, CSGDB_INVALID_ARGUMENT);
+        assert_eq!(
+            unsafe { csgdb_reset_and_clear_bindings(ptr::null_mut()) },
+            CSGDB_INVALID_ARGUMENT
+        );
+        let mut blob_view = ptr::dangling::<c_void>();
+        let mut blob_view_len = usize::MAX;
+        assert_eq!(
+            unsafe {
+                csgdb_column_blob_view(ptr::null(), 0, &raw mut blob_view, &raw mut blob_view_len)
+            },
+            CSGDB_INVALID_ARGUMENT
+        );
+        assert!(blob_view.is_null());
+        assert_eq!(blob_view_len, 0);
     }
 
     #[test]
@@ -1848,6 +1967,7 @@ mod tests {
         };
         assert_eq!(result, CSGDB_OK);
         assert!(!database.is_null());
+        assert!(database_has_engine_mutex(database));
 
         let sql = CString::new(
             "CREATE TABLE event(id INTEGER PRIMARY KEY); INSERT INTO event DEFAULT VALUES;",
@@ -1861,12 +1981,15 @@ mod tests {
     #[test]
     fn plaintext_v2_open_is_explicit() {
         let (path, c_path) = test_path("plaintext");
-        let flags = (OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::PLAINTEXT).bits();
+        let flags =
+            (OpenFlags::READWRITE | OpenFlags::CREATE | OpenFlags::PLAINTEXT | OpenFlags::NOMUTEX)
+                .bits();
         let vfs_name = default_vfs_name();
         let mut database = ptr::null_mut();
         let result =
             unsafe { csgdb_open_v2(c_path.as_ptr(), &raw mut database, flags, vfs_name.as_ptr()) };
         assert_eq!(result, CSGDB_OK);
+        assert!(!database_has_engine_mutex(database));
         assert_eq!(unsafe { csgdb_close(database) }, CSGDB_OK);
         remove_database(&path);
     }
@@ -1901,6 +2024,7 @@ mod tests {
             unsafe { csgdb_open_v2(c_path.as_ptr(), &raw mut database, flags, ptr::null(),) },
             CSGDB_OK
         );
+        assert!(database_has_engine_mutex(database));
 
         let sql = c"SELECT ?1 + 1";
         let mut statements = [ptr::null_mut(); 2];
@@ -2157,6 +2281,16 @@ mod tests {
 
         assert_eq!(unsafe { csgdb_column_int64(statement, 0) }, 0);
         assert_eq!(unsafe { csgdb_errcode(database) }, CSGDB_MISUSE);
+        let mut blob_view = ptr::dangling::<c_void>();
+        let mut blob_view_len = usize::MAX;
+        assert_eq!(
+            unsafe {
+                csgdb_column_blob_view(statement, 3, &raw mut blob_view, &raw mut blob_view_len)
+            },
+            CSGDB_MISUSE
+        );
+        assert!(blob_view.is_null());
+        assert_eq!(blob_view_len, 0);
         assert_eq!(unsafe { csgdb_step(statement) }, CSGDB_ROW);
         assert_eq!(unsafe { csgdb_column_type(statement, 0) }, CSGDB_INTEGER);
         assert_eq!(unsafe { csgdb_column_int64(statement, 0) }, 41);
@@ -2175,9 +2309,93 @@ mod tests {
             unsafe { std::slice::from_raw_parts(blob.cast::<u8>(), blob_len) },
             payload
         );
+        blob_view = ptr::dangling::<c_void>();
+        blob_view_len = usize::MAX;
+        assert_eq!(
+            unsafe {
+                csgdb_column_blob_view(statement, 5, &raw mut blob_view, &raw mut blob_view_len)
+            },
+            CSGDB_RANGE
+        );
+        assert!(blob_view.is_null());
+        assert_eq!(blob_view_len, 0);
+        assert_eq!(
+            unsafe {
+                csgdb_column_blob_view(statement, 3, &raw mut blob_view, &raw mut blob_view_len)
+            },
+            CSGDB_OK
+        );
+        assert_eq!(blob_view_len, payload.len());
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(blob_view.cast::<u8>(), blob_view_len) },
+            payload
+        );
+        blob_view_len = usize::MAX;
+        assert_eq!(
+            unsafe {
+                csgdb_column_blob_view(statement, 3, ptr::null_mut(), &raw mut blob_view_len)
+            },
+            CSGDB_INVALID_ARGUMENT
+        );
+        assert_eq!(blob_view_len, 0);
         assert_eq!(unsafe { csgdb_column_type(statement, 4) }, CSGDB_NULL);
+        blob_view = ptr::dangling::<c_void>();
+        blob_view_len = usize::MAX;
+        assert_eq!(
+            unsafe {
+                csgdb_column_blob_view(statement, 4, &raw mut blob_view, &raw mut blob_view_len)
+            },
+            CSGDB_OK
+        );
+        assert!(blob_view.is_null());
+        assert_eq!(blob_view_len, 0);
         assert!(unsafe { csgdb_column_text(statement, 4) }.is_null());
         assert_eq!(unsafe { csgdb_step(statement) }, CSGDB_DONE);
+        assert_eq!(
+            unsafe { csgdb_reset_and_clear_bindings(statement) },
+            CSGDB_OK
+        );
+        assert_eq!(unsafe { csgdb_step(statement) }, CSGDB_DONE);
+        assert_eq!(
+            unsafe { csgdb_reset_and_clear_bindings(statement) },
+            CSGDB_OK
+        );
+        assert_eq!(unsafe { csgdb_finalize(statement) }, CSGDB_OK);
+
+        let duplicate = c"INSERT INTO sample(id) VALUES (?1)";
+        statement = ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                csgdb_prepare_v2(
+                    database,
+                    duplicate.as_ptr(),
+                    -1,
+                    &raw mut statement,
+                    ptr::null_mut(),
+                )
+            },
+            CSGDB_OK
+        );
+        assert_eq!(unsafe { csgdb_bind_int64(statement, 1, 41) }, CSGDB_OK);
+        assert_eq!(unsafe { csgdb_step(statement) }, CSGDB_CONSTRAINT);
+        assert_eq!(
+            unsafe { csgdb_reset_and_clear_bindings(statement) },
+            CSGDB_CONSTRAINT
+        );
+        // Reset reports the previous constraint while still clearing the old
+        // binding. A NULL INTEGER PRIMARY KEY therefore receives a fresh row
+        // id instead of repeating the duplicate value 41.
+        assert_eq!(unsafe { csgdb_step(statement) }, CSGDB_DONE);
+        assert_eq!(
+            unsafe { csgdb_reset_and_clear_bindings(statement) },
+            CSGDB_OK
+        );
+        assert_eq!(unsafe { csgdb_bind_int64(statement, 1, 43) }, CSGDB_OK);
+        assert_eq!(unsafe { csgdb_step(statement) }, CSGDB_DONE);
+        assert_eq!(
+            unsafe { csgdb_reset_and_clear_bindings(statement) },
+            CSGDB_OK
+        );
         assert_eq!(unsafe { csgdb_finalize(statement) }, CSGDB_OK);
         assert_eq!(unsafe { csgdb_release_memory(database) }, CSGDB_OK);
         assert_eq!(unsafe { csgdb_close(database) }, CSGDB_OK);

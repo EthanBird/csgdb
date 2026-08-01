@@ -1,0 +1,171 @@
+{
+  "schema_version": 1,
+  "generated_at_utc": "2026-08-01T20:18:34Z",
+  "status": "global_gate_failed",
+  "policy": "zero-tolerance median Pareto; higher throughput is better; lower latency, memory, file size, and phase duration are better",
+  "environment": {
+    "host_cpu": "Intel Xeon Platinum 8573C",
+    "os": "Linux 6.12.13 x86_64",
+    "cpu_affinity_query_api": "0",
+    "cpu_affinity_engine_gate": "0-8",
+    "query_api_rounds": 8,
+    "engine_gate_rounds": 8,
+    "warmup_pairs": 1,
+    "security": "encrypted",
+    "page_cache_bytes_per_connection": 4194304,
+    "system_sqlite_version": "3.45.1",
+    "csgdb_engine_sqlite_version": "3.50.4"
+  },
+  "artifacts": {
+    "candidate_library_sha256": "40d87fa6054055a4e5c1f618f727770a1cdd94b25e7699009f8d83e008491443",
+    "engine_harness_sha256": "8589145515df68886a65d3471b03e9f4b76fe647ccc36b1d3cb4f0d7e9140b3a",
+    "query_harness_sha256": "0fe6ff7fe72caf4c935e39d351d9a034b85050e4ffaf05799c86167171ac0b6d",
+    "system_sqlite_library_sha256": "eac351cf84d688d1f9235e6165bd57555b31a491cd2f65e0dca67daa69036370"
+  },
+  "profiling": {
+    "tool": "gprofng",
+    "workload": "10 second encrypted read-stress, 100000 rows, CPU affinity 0-8",
+    "reads": 8945852,
+    "errors": 0,
+    "integrity_ok": true,
+    "hotspots": [
+      { "symbol": "sqlite3Codec", "inclusive_pct": 35.36 },
+      { "symbol": "sqlcipher_page_cipher", "inclusive_pct": 34.55 },
+      { "symbol": "sqlcipher_page_hmac", "inclusive_pct": 22.12 },
+      { "symbol": "SHA-256 hardware path", "exclusive_pct": 15.43 },
+      { "symbol": "pread", "exclusive_pct": 11.40, "inclusive_pct": 12.47 },
+      { "symbol": "pthread mutex lock/unlock", "exclusive_pct": 10.40 },
+      { "symbol": "pcache1Fetch", "exclusive_pct": 5.88 },
+      { "symbol": "fstat", "exclusive_pct": 5.72 },
+      { "symbol": "csgdb_step", "exclusive_pct": 0.12 }
+    ],
+    "limitation": "strace was unavailable because the container denied ptrace"
+  },
+  "query_api": [
+    {
+      "workload": "fixed",
+      "mode": "direct-reference",
+      "throughput_ops_s": 437600.199,
+      "p50_ns": 2178.5,
+      "p95_ns": 2284.5,
+      "p99_ns": 2333.5,
+      "vm_hwm_kib": 8172,
+      "scenario_pass": true
+    },
+    {
+      "workload": "fixed",
+      "mode": "public-query_i64_cached",
+      "throughput_ops_s": 919016.252,
+      "p50_ns": 1008.5,
+      "p95_ns": 1066.0,
+      "p99_ns": 1103.5,
+      "vm_hwm_kib": 8130,
+      "scenario_pass": true
+    },
+    {
+      "workload": "hot16",
+      "mode": "direct-reference",
+      "throughput_ops_s": 421227.297,
+      "p50_ns": 2222.0,
+      "p95_ns": 2326.0,
+      "p99_ns": 2379.5,
+      "vm_hwm_kib": 8226,
+      "scenario_pass": false
+    },
+    {
+      "workload": "hot16",
+      "mode": "public-query_i64_cached",
+      "throughput_ops_s": 911097.109,
+      "p50_ns": 1037.0,
+      "p95_ns": 1109.0,
+      "p99_ns": 1157.5,
+      "vm_hwm_kib": 8278,
+      "scenario_pass": false
+    },
+    {
+      "workload": "overflow17",
+      "mode": "direct-reference",
+      "throughput_ops_s": 434874.630,
+      "p50_ns": 2200.5,
+      "p95_ns": 2307.0,
+      "p99_ns": 2349.0,
+      "vm_hwm_kib": 8120,
+      "scenario_pass": false
+    },
+    {
+      "workload": "overflow17",
+      "mode": "public-query_i64_cached",
+      "throughput_ops_s": 362069.502,
+      "p50_ns": 2625.0,
+      "p95_ns": 2778.0,
+      "p99_ns": 2856.5,
+      "vm_hwm_kib": 8322,
+      "scenario_pass": false
+    }
+  ],
+  "system_comparison": [
+    { "metric": "open_ms", "category": "lifecycle", "sqlite_median": 0.328, "csgdb_median": 4.305, "candidate_delta_pct": 1212.500, "pass": false },
+    { "metric": "bulk_insert_ms", "category": "write", "sqlite_median": 176.0075, "csgdb_median": 277.853, "candidate_delta_pct": 57.864, "pass": false },
+    { "metric": "durable_autocommit_ms", "category": "write", "sqlite_median": 645.5985, "csgdb_median": 672.481, "candidate_delta_pct": 4.164, "pass": false },
+    { "metric": "point_read_ms", "category": "query", "sqlite_median": 397.5375, "csgdb_median": 631.584, "candidate_delta_pct": 58.874, "pass": false },
+    { "metric": "range_scan_ms", "category": "query", "sqlite_median": 417.8265, "csgdb_median": 982.0915, "candidate_delta_pct": 135.048, "pass": false },
+    { "metric": "update_ms", "category": "write", "sqlite_median": 284.8705, "csgdb_median": 697.7775, "candidate_delta_pct": 144.946, "pass": false },
+    { "metric": "read_p50_us", "category": "query", "sqlite_median": 2.3865, "csgdb_median": 4.311, "candidate_delta_pct": 80.641, "pass": false },
+    { "metric": "read_p95_us", "category": "query", "sqlite_median": 4.8435, "csgdb_median": 7.6025, "candidate_delta_pct": 56.963, "pass": false },
+    { "metric": "read_p99_us", "category": "query", "sqlite_median": 43.563, "csgdb_median": 42.9205, "candidate_delta_pct": -1.475, "pass": true },
+    { "metric": "commit_p50_us", "category": "write", "sqlite_median": 672.3145, "csgdb_median": 305.6675, "candidate_delta_pct": -54.535, "pass": true },
+    { "metric": "commit_p95_us", "category": "write", "sqlite_median": 15123.5195, "csgdb_median": 3320.521, "candidate_delta_pct": -78.044, "pass": true },
+    { "metric": "commit_p99_us", "category": "write", "sqlite_median": 48221.019, "csgdb_median": 12892.0025, "candidate_delta_pct": -73.265, "pass": true },
+    { "metric": "stress_reads_per_second", "category": "query", "sqlite_median": 943859.659, "csgdb_median": 722374.195, "candidate_delta_pct": -23.466, "pass": false },
+    { "metric": "stress_writes_per_second", "category": "write", "sqlite_median": 10354.258, "csgdb_median": 30364.800, "candidate_delta_pct": 193.259, "pass": true },
+    { "metric": "database_bytes", "category": "resource", "sqlite_median": 20271104, "csgdb_median": 22296576, "candidate_delta_pct": 9.992, "pass": false },
+    { "metric": "max_rss_kib", "category": "resource", "sqlite_median": 51766, "csgdb_median": 51370, "candidate_delta_pct": -0.765, "pass": true }
+  ],
+  "experiments": [
+    {
+      "name": "fixed bounded statement cache",
+      "decision": "retain as explicit API",
+      "reason": "fixed SQL passed throughput, p50, p95, p99, and peak-RSS median gates"
+    },
+    {
+      "name": "cache overflow at 17 SQL texts",
+      "decision": "reject as a default path",
+      "reason": "throughput, every latency percentile, and peak RSS regressed"
+    },
+    {
+      "name": "reuse-gated cache admission",
+      "decision": "reject",
+      "reason": "fixed and overflow17 passed, but the hot16 peak-RSS median increased 0.856%"
+    },
+    {
+      "name": "bounded read snapshot session",
+      "decision": "reject",
+      "reason": "the fastest point-read variant reduced writer throughput and amplified WAL; coordinated renewal regressed read throughput and latency"
+    },
+    {
+      "name": "4 KiB encrypted pages",
+      "decision": "reject",
+      "reason": "smaller files and faster bulk writes did not offset point, range, commit-latency, memory, and mixed-stress regressions"
+    },
+    {
+      "name": "HMAC seed cache",
+      "decision": "reject",
+      "reason": "point throughput and mixed p99 regressed"
+    },
+    {
+      "name": "HMAC temporary-memory cleanup",
+      "decision": "reject",
+      "reason": "read p99 regressed 22.22% and peak RSS increased despite higher median throughput"
+    },
+    {
+      "name": "AES context reset",
+      "decision": "reject",
+      "reason": "point, range, read percentiles, stress reads, and RSS regressed"
+    },
+    {
+      "name": "ThinLTO with one codegen unit",
+      "decision": "reject",
+      "reason": "RSS and read-stress latency regressed"
+    }
+  ]
+}

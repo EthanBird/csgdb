@@ -15,8 +15,9 @@
 9. [2026-08-01 运行时性能基线](performance-2026-08-01.md)：相对 SQLite 的单连接与四读一写实测结果。
 10. [2026-08-01 底层性能优化复测](performance-optimization-2026-08-01.md)：首轮热路径优化、缓存曲线、长压结果和下一性能切片。
 11. [2026-08-01 底层性能优化第二轮](performance-optimization-round2-2026-08-01.md)：全局页缓存锁、Provider 热路径、页粒度、专业剖析与新的性能差距。
-12. [开发路线](development-plan.md)：里程碑、依赖和完成定义。
-13. [架构决策](decisions/README.md)：已经接受的公共接口、连接、Group Commit、WAL 维护、类型化 Schema、索引、迁移、查询约束和故障注入边界。
+12. [2026-08-02 查询性能第三轮](query-performance-round3-2026-08-02.html)：显式热查询缓存、严格零退化门、系统级差距与被拒绝候选。
+13. [开发路线](development-plan.md)：里程碑、依赖和完成定义。
+14. [架构决策](decisions/README.md)：已经接受的公共接口、连接、Group Commit、WAL 维护、类型化 Schema、索引、迁移、查询约束和故障注入边界。
 
 ## 文档规范
 

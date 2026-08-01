@@ -17,9 +17,9 @@ pub use collection::{
 };
 pub use csgdb_derive::Collection;
 pub use query::{
-    CollectionQuery, CollectionQueryExecutor, IntoQueryValue, OrderDirection, OrderedFieldValue,
-    Predicate, QueryDraft, QueryOrder, MAX_PREDICATE_DEPTH, MAX_PREDICATE_NODES, MAX_QUERY_LIMIT,
-    MAX_QUERY_ORDER_FIELDS,
+    CollectionExistsExecutor, CollectionExistsQuery, CollectionQuery, CollectionQueryExecutor,
+    IntoQueryValue, OrderDirection, OrderedFieldValue, Predicate, QueryDraft, QueryOrder,
+    MAX_PREDICATE_DEPTH, MAX_PREDICATE_NODES, MAX_QUERY_LIMIT, MAX_QUERY_ORDER_FIELDS,
 };
 
 pub use pool::{
@@ -122,6 +122,24 @@ impl DatabaseBuilder {
     pub fn open(self) -> Result<Database> {
         let plan = self.plan()?;
         Database::open_resolved(&plan, false)
+    }
+
+    /// Opens a connection that is owned by one caller at a time.
+    ///
+    /// This removes the engine's redundant per-connection mutex while keeping
+    /// cross-connection synchronization. Rust's borrowing rules already
+    /// serialize safe access to [`Database`]; callers using raw handles must
+    /// uphold the same rule themselves. Explicitly use [`Self::open`] when a
+    /// FULLMUTEX engine handle is required.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when planning, key resolution, storage opening, or
+    /// connection initialization fails.
+    pub fn open_single_owner(self) -> Result<Database> {
+        let plan = self.plan()?;
+        let cache_size_bytes = plan.cache_size_bytes();
+        Database::open_resolved_single_owner(&plan, false, cache_size_bytes)
     }
 }
 
@@ -385,14 +403,29 @@ impl Database {
         self.connection.release_memory()
     }
 
-    /// Reads a single integer value.
+    /// Reads the first column of the first result row as an integer.
     ///
     /// # Errors
     ///
-    /// Returns an error when the query fails or does not produce exactly one
-    /// convertible value.
+    /// Returns an error when the query fails, returns no rows, or its first
+    /// column cannot be read as an integer. Additional rows are not inspected.
     pub fn query_i64(&self, sql: &str) -> Result<i64> {
         self.connection.query_i64(sql)
+    }
+
+    /// Reads the first integer through the bounded prepared-statement cache.
+    ///
+    /// This is the convenience path for a repeatedly executed, small set of
+    /// SQL strings. Use [`Self::query_i64`] for one-shot or high-cardinality
+    /// SQL, and retain a [`Statement`] for the lowest-overhead parameterized
+    /// hot path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the query fails, returns no rows, or its first
+    /// column cannot be read as an integer. Additional rows are not inspected.
+    pub fn query_i64_cached(&self, sql: &str) -> Result<i64> {
+        self.connection.query_i64_cached(sql)
     }
 
     /// Starts a deferred transaction.
@@ -437,6 +470,10 @@ mod tests {
 
     static NEXT_DATABASE: AtomicU64 = AtomicU64::new(1);
 
+    unsafe extern "C" {
+        fn sqlite3_db_mutex(database: *mut c_void) -> *mut c_void;
+    }
+
     struct TestDatabasePath {
         path: PathBuf,
     }
@@ -467,6 +504,26 @@ mod tests {
         KeySource::Raw(
             SecretKey::from_slice(&[byte; RAW_KEY_LENGTH]).expect("valid fixed-size key"),
         )
+    }
+
+    #[test]
+    fn explicit_single_owner_open_removes_the_engine_mutex_and_can_move_threads() {
+        let path = TestDatabasePath::new("single-owner");
+        let database = Database::builder(path.path())
+            .key(test_key(1))
+            .open_single_owner()
+            .expect("open single-owner database");
+        // SAFETY: the database is live and this test is its only owner.
+        let mutex = unsafe { sqlite3_db_mutex(database.as_raw_handle()) };
+        assert!(mutex.is_null());
+
+        let database = std::thread::spawn(move || {
+            assert_eq!(database.query_i64("SELECT 1").expect("query"), 1);
+            database
+        })
+        .join()
+        .expect("single-owner worker");
+        database.close().expect("close database");
     }
 
     #[test]
@@ -761,6 +818,12 @@ mod tests {
             database
                 .query_i64("SELECT count(*) FROM item")
                 .expect("count"),
+            1
+        );
+        assert_eq!(
+            database
+                .query_i64_cached("SELECT count(*) FROM item")
+                .expect("cached count"),
             1
         );
     }
