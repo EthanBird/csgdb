@@ -12,8 +12,9 @@
 6. [嵌入式与性能设计](embedded-performance.md)：设备档位、缓存、索引和基准。
 7. [测试与发布门槛](testing.md)：正确性、安全、兼容性和性能验证。
 8. [构建基线](build-baseline.md)：已验证工具链、构建时间和产物大小。
-9. [开发路线](development-plan.md)：里程碑、依赖和完成定义。
-10. [架构决策](decisions/README.md)：已经接受的公共接口、连接、Group Commit、WAL 维护、类型化 Schema、索引、迁移、查询约束和故障注入边界。
+9. [2026-08-01 运行时性能基线](performance-2026-08-01.md)：相对 SQLite 的单连接与四读一写实测结果。
+10. [开发路线](development-plan.md)：里程碑、依赖和完成定义。
+11. [架构决策](decisions/README.md)：已经接受的公共接口、连接、Group Commit、WAL 维护、类型化 Schema、索引、迁移、查询约束和故障注入边界。
 
 ## 文档规范
 
